@@ -140,6 +140,9 @@ def search_result_embed(rec: dict, query: str) -> discord.Embed:
         description=f"Matched **“{query}”** · via *{rec.get('match_method', 'fuzzy')}*",
         color=_media_color(mt),
     )
+    img = _valid_image_url(rec.get("image") or "")
+    if img:
+        e.set_image(url=img)
     e.add_field(name="Kind", value=mt.title(), inline=True)
     if rec.get("season") is not None or rec.get("unit"):
         bits = []
@@ -170,6 +173,9 @@ def item_search_embed(items: list[dict], query: str) -> discord.Embed:
         color=config.THEME_COLOR,
         description=f"{len(items)} match(es) from the knowledge base",
     )
+    img = _valid_image_url(items[0].get("image") or "") if items else None
+    if img:
+        e.set_thumbnail(url=img)
     for i, it in enumerate(items[:10], 1):
         e.add_field(
             name=f"{i}. {it.get('source')}",
@@ -210,6 +216,9 @@ def digest_embed(items: list[dict], label: str) -> discord.Embed:
         color=config.THEME_COLOR,
         description=f"{len(items)} fresh stories · newest first",
     )
+    img = _valid_image_url(items[0].get("image") or "") if items else None
+    if img:
+        e.set_image(url=img)
     lines = []
     for i, it in enumerate(items[:12], 1):
         title = _trim(it.get("title", ""), 90)

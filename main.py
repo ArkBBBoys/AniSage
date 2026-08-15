@@ -278,6 +278,7 @@ async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "a
                 key=live["key"], canonical=live["canonical"],
                 media_type=live["media_type"], external_id=live.get("anilist_id", ""),
                 anilist_id=live.get("anilist_id", ""), mal_id=live.get("mal_id", ""),
+                image=live.get("image", ""),
                 aliases=[], watch_links=live["watch_links"], read_links=live["read_links"],
             ))
             rec = db.get_title(live["key"])
@@ -322,6 +323,7 @@ async def cmd_follow(inter: discord.Interaction, name: str):
             db.learn_title(TitleRecord(
                 key=live["key"], canonical=live["canonical"],
                 media_type=live["media_type"], anilist_id=live["anilist_id"],
+                image=live.get("image", ""),
                 watch_links=live["watch_links"], read_links=live["read_links"]))
             rec = db.get_title(live["key"])
     if not rec:
@@ -433,6 +435,7 @@ async def cmd_where(inter: discord.Interaction, name: str, media_type: str = "an
             db.learn_title(TitleRecord(
                 key=live["key"], canonical=live["canonical"],
                 media_type=live["media_type"], anilist_id=live["anilist_id"],
+                image=live.get("image", ""),
                 watch_links=live["watch_links"], read_links=live["read_links"]))
             rec = db.get_title(live["key"])
     if not rec:

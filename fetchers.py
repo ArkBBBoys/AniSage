@@ -158,6 +158,7 @@ query ($type: MediaType, $per: Int) {
   Page(perPage: $per) {
     media(sort: TRENDING_DESC, type: $type) {
       id type countryOfOrigin title { romaji english native }
+      coverImage { large } bannerImage
       siteUrl externalLinks { url site }
     }
   }
@@ -168,10 +169,17 @@ query ($search: String, $type: MediaType) {
   Page(perPage: 5) {
     media(search: $search, type: $type) {
       id type countryOfOrigin title { romaji english native }
+      coverImage { large } bannerImage
       siteUrl externalLinks { url site }
     }
   }
 }"""
+
+
+def _image(m) -> str:
+    """AniList cover/banner image; covers are tiny, banner is the wide one."""
+    cover = (m.get("coverImage") or {}).get("large") or ""
+    return cover or (m.get("bannerImage") or "")
 
 
 async def fetch_anilist_trending(session, media_type: str = "ANIME", per: int = 25) -> list[TitleRecord]:
@@ -188,7 +196,7 @@ async def fetch_anilist_trending(session, media_type: str = "ANIME", per: int = 
             recs.append(TitleRecord(
                 key=normalize(canonical), canonical=canonical,
                 media_type=_media_type(m), external_id=str(m["id"]),
-                anilist_id=str(m["id"]), aliases=aliases,
+                anilist_id=str(m["id"]), image=_image(m), aliases=aliases,
                 watch_links=watch, read_links=read,
             ))
     except Exception as ex:
@@ -209,6 +217,7 @@ async def fetch_anilist_search(session, query: str, media_type: str = "ANIME") -
         return {
             "canonical": canonical, "key": normalize(canonical),
             "media_type": _media_type(m), "anilist_id": str(m["id"]),
+            "image": _image(m),
             "watch_links": watch, "read_links": read,
             "site_url": m.get("siteUrl", ""),
         }

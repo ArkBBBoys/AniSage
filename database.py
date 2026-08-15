@@ -80,6 +80,7 @@ class TitleRecord:
     external_id: str = ""
     anilist_id: str = ""
     mal_id: str = ""
+    image: str = ""
     aliases: list[str] = None  # type: ignore
     watch_links: list[str] = None  # type: ignore
     read_links: list[str] = None  # type: ignore
@@ -131,6 +132,7 @@ class Title(Base):
     external_id: Mapped[str] = mapped_column(String, default="")
     anilist_id: Mapped[str] = mapped_column(String, default="")
     mal_id: Mapped[str] = mapped_column(String, default="")
+    image: Mapped[str] = mapped_column(Text, default="")
     aliases: Mapped[str] = mapped_column(Text, default="[]")
     watch_links: Mapped[str] = mapped_column(Text, default="[]")
     read_links: Mapped[str] = mapped_column(Text, default="[]")
@@ -241,6 +243,16 @@ class KnowledgeDB:
         Base.metadata.create_all(self.engine)
         self._session = sessionmaker(bind=self.engine, expire_on_commit=False)
         self._migrate_resources_columns()
+        self._migrate_titles_columns()
+
+    def _migrate_titles_columns(self):
+        """Best-effort upgrade for pre-existing DBs missing the image column."""
+        try:
+            with self._session() as s:
+                s.execute(text("ALTER TABLE titles ADD COLUMN image TEXT DEFAULT ''"))
+                s.commit()
+        except Exception:
+            pass  # column already exists (or table absent)
 
     def _migrate_resources_columns(self):
         """Best-effort upgrade for pre-existing DBs missing newer columns."""
@@ -338,6 +350,8 @@ class KnowledgeDB:
                     existing.anilist_id = rec.anilist_id
                 if rec.mal_id:
                     existing.mal_id = rec.mal_id
+                if rec.image:
+                    existing.image = rec.image
                 existing.watch_links = json.dumps(
                     rec.watch_links or json.loads(existing.watch_links or "[]"))
                 existing.read_links = json.dumps(
@@ -348,7 +362,8 @@ class KnowledgeDB:
                 s.add(Title(
                     key=rec.key, canonical=rec.canonical, media_type=rec.media_type,
                     external_id=rec.external_id, anilist_id=rec.anilist_id,
-                    mal_id=rec.mal_id, aliases=json.dumps(rec.aliases),
+                    mal_id=rec.mal_id, image=rec.image,
+                    aliases=json.dumps(rec.aliases),
                     watch_links=json.dumps(rec.watch_links),
                     read_links=json.dumps(rec.read_links),
                     first_seen=now, last_seen=now, times_seen=1, confidence=5.0,
