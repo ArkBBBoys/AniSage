@@ -87,6 +87,25 @@ def header_embed(title: str, subtitle: str | None = None,
     return e
 
 
+def _valid_image_url(url: str) -> str | None:
+    """Normalize/validate an image URL; None when it can't render in Discord.
+
+    Discord silently drops broken or unsupported images, so we pre-check:
+    http(s) only, no SVG, no data URIs, no tracking pixels.
+    """
+    if not url:
+        return None
+    u = url.strip()
+    if u.startswith("//"):
+        u = "https:" + u
+    low = u.lower()
+    if not low.startswith(("http://", "https://")):
+        return None
+    if low.endswith(".svg") or "data:" in low or "pixel" in low:
+        return None
+    return u
+
+
 def news_embed(item: dict, alert: str | None = None) -> discord.Embed:
     e = discord.Embed(
         title=_trim(item.get("title", "Untitled"), 256),
@@ -101,8 +120,9 @@ def news_embed(item: dict, alert: str | None = None) -> discord.Embed:
     else:
         e.set_author(name=item.get("source", "AniSage"), url=url)
         footer_note = BRAND
-    if item.get("image"):
-        e.set_thumbnail(url=item["image"])
+    img = _valid_image_url(item.get("image") or "")
+    if img:
+        e.set_image(url=img)
     mt = item.get("media_type", "unknown")
     if mt != "unknown":
         e.add_field(name="Type", value=mt.title(), inline=True)

@@ -48,6 +48,10 @@ BROADCAST_INTERVAL = _env_int("BROADCAST_INTERVAL", 1800)  # 30 min
 # Max items kept per source in memory between runs.
 MAX_CACHE = _env_int("MAX_CACHE", 500)
 
+# How many image-less news items per source get an og:image page fetch
+# (bounded so scraping stays fast).
+OG_IMAGE_LIMIT = _env_int("OG_IMAGE_LIMIT", 12)
+
 # User-Agent used for scraping so sites don't 403 us immediately.
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

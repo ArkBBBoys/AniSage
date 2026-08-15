@@ -29,6 +29,43 @@ from matcher import normalize
 HEADERS = {"User-Agent": config.USER_AGENT}
 
 
+def _html_img_url(html: str) -> str:
+    """First real <img> URL inside a summary/content blob.
+
+    Skips data URIs, SVGs and tracking pixels -- none of them render in Discord.
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for img in soup.find_all("img"):
+        src = (img.get("src") or "").strip()
+        low = src.lower()
+        if not src.startswith("http"):
+            continue
+        if low.startswith("data:") or low.endswith(".svg") or "pixel" in low:
+            continue
+        return src
+    return ""
+
+
+async def _og_image(session, url: str) -> str:
+    """Read the og:image meta tag from an article page (RSS often omits images)."""
+    try:
+        async with session.get(url, headers=HEADERS, timeout=15) as r:
+            if r.status != 200:
+                return ""
+            text = await r.text()
+        soup = await _parse_html(text)
+        for prop in ("og:image", "og:image:url", "twitter:image"):
+            tag = soup.find("meta", attrs={"property": prop}) or \
+                soup.find("meta", attrs={"name": prop})
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+    except Exception as ex:
+        print(f"[og-image] {url[:60]} failed: {ex}")
+    return ""
+
+
 # --------------------------------------------------------------------- RSS
 async def fetch_rss(session, source: dict) -> list[NewsItem]:
     out: list[NewsItem] = []
@@ -40,18 +77,24 @@ async def fetch_rss(session, source: dict) -> list[NewsItem]:
             title = (e.get("title") or "").strip()
             link = e.get("link") or ""
             summary = ""
-            if "summary" in e:
-                summary = BeautifulSoup(e["summary"], "html.parser").get_text(" ", strip=True)
-            elif "description" in e:
-                summary = BeautifulSoup(e["description"], "html.parser").get_text(" ", strip=True)
+            for key in ("summary", "description"):
+                if key in e:
+                    summary = BeautifulSoup(e[key], "html.parser").get_text(" ", strip=True)
+                    break
             img = ""
             if "media_content" in e and e["media_content"]:
                 img = e["media_content"][0].get("url", "")
+            if not img:
+                img = _html_img_url(e.get("summary") or "")
+            if not img and e.get("content"):
+                img = _html_img_url(e["content"][0].get("value", ""))
             pub = e.get("published") or e.get("updated") or ""
             out.append(NewsItem(
                 source=source["name"], kind=source["kind"], title=title,
                 url=link, summary=summary[:600], image=img, published=pub,
             ))
+        for it in [i for i in out if not i.image][: config.OG_IMAGE_LIMIT]:
+            it.image = await _og_image(session, it.url)
     except Exception as ex:  # network/parse errors are logged, not fatal
         print(f"[rss] {source['name']} failed: {ex}")
     return out
