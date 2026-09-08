@@ -62,7 +62,9 @@ USER_AGENT = (
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "78"))
 
 # ---------------------------------------------------------------------------
-# News sources (RSS). Add/remove freely; the bot learns which ones are useful.
+# News sources (RSS) — now broad, not just 8 fixed feeds.
+# The bot also crawls the whole web via DDG (fetch_web_news) in parallel,
+# so it’s not limited to these specific feeds.
 # ---------------------------------------------------------------------------
 RSS_SOURCES: list[dict] = [
     {"name": "Anime News Network", "url": "https://www.animenewsnetwork.com/all/rss.xml", "kind": "news"},
@@ -73,6 +75,13 @@ RSS_SOURCES: list[dict] = [
     {"name": "MangaUpdates", "url": "https://www.mangaupdates.com/rss.php", "kind": "news"},
     {"name": "Comicbook.com Anime", "url": "https://comicbook.com/anime/feed/", "kind": "news"},
     {"name": "Siliconera", "url": "https://www.siliconera.com/feed/", "kind": "news"},
+    # Additional broad sources — whole-web coverage, not just the original 8
+    {"name": "MyAnimeList News", "url": "https://myanimelist.net/rss/news.xml", "kind": "news"},
+    {"name": "Anime Corner", "url": "https://animecorner.me/feed/", "kind": "news"},
+    {"name": "Anime Trending News", "url": "https://anitrendz.net/news/feed/", "kind": "news"},
+    {"name": "Manga Tokyo", "url": "https://manga.tokyo/feed/", "kind": "news"},
+    {"name": "OtakuKart", "url": "https://otakukart.com/feed/", "kind": "news"},
+    {"name": "Anime UK News", "url": "https://animeuknews.net/feed/", "kind": "news"},
 ]
 
 # Extra sites that are scraped directly (HTML) for release pages.

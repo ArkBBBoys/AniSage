@@ -192,20 +192,38 @@ def stats_embed(stats: dict) -> discord.Embed:
         title="🧠 AniSage — Knowledge & Proficiency",
         color=config.THEME_COLOR,
     )
+    # Knowledge base — now with depth
     e.add_field(
         name="📚 Knowledge base",
-        value=f"**{stats['items']}** news items\n**{stats['titles']}** titles learned",
+        value=f"**{stats['items']}** news items · **{stats['titles']}** titles learned\n"
+              f"Depth **{stats.get('depth',0)}%** (avg ×{stats.get('avg_times_seen',0)}) · Breadth **{stats.get('breadth',0)}%**",
         inline=False,
     )
+    # Performance — now with smoothed accuracy and breakdown
+    acc = stats.get('accuracy', 0)
+    acc_s = stats.get('accuracy_smooth', acc)
     e.add_field(
-        name="🎯 Performance",
-        value=f"Match accuracy **{stats['accuracy']}%** · "
-              f"avg confidence **{stats['avg_confidence']}%**",
+        name="🎯 Performance (self-learning)",
+        value=f"Accuracy **{acc}%** (smooth **{acc_s}%**) · "
+              f"avg confidence **{stats['avg_confidence']}%**\n"
+              f"7-day: **{stats.get('feedback_7d',0)}** feedback · Alias quality **{stats.get('alias_quality',0)}%**",
         inline=False,
     )
-    e.add_field(name="🆓 Free hosts (EverythingMoe)", value=stats["resources"], inline=True)
-    e.add_field(name="💬 Human feedback", value=stats["feedback"], inline=True)
-    e.add_field(name="🚀 Proficiency", value=bar(stats["proficiency"]), inline=False)
+    e.add_field(name="🆓 Free hosts", value=f"{stats.get('alive_resources', stats['resources'])}/{stats['resources']} alive", inline=True)
+    e.add_field(name="💬 Feedback", value=f"{stats['feedback']} total", inline=True)
+    e.add_field(name="⚡ Vitality / Velocity", value=f"Vitality **{stats.get('vitality',0)}%** · Velocity **{stats.get('velocity',0)}%**", inline=True)
+    # Proficiency breakdown
+    bd = stats.get('proficiency_breakdown', {})
+    if bd:
+        e.add_field(
+            name="🧩 Proficiency Breakdown",
+            value=f"Mastery {bd.get('mastery',0)}% · Accuracy {bd.get('accuracy',0)}% · Breadth {bd.get('breadth',0)}%\n"
+                  f"Depth {bd.get('depth',0)}% · Vitality {bd.get('vitality',0)}% · Velocity {bd.get('velocity',0)}% +{bd.get('momentum',0)} momentum",
+            inline=False,
+        )
+    e.add_field(name="🚀 Proficiency — self-improving", value=bar(stats["proficiency"]) + f"  *{stats['proficiency']}/100*", inline=False)
+    # Small footer hint for self-improvement
+    e.add_field(name="💡 Tip", value="Use ✅/❌ on `/search` to teach me — proficiency auto-tunes hourly via Bayesian + decay + pruning.", inline=False)
     _stamp(e)
     return e
 
