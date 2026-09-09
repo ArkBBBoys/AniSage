@@ -379,6 +379,40 @@ async def adirect_search_links(rec: dict) -> str:
     return "\n".join(links) if links else "—"
 
 
+# ------------------------------------------------------------------ media types
+_MEDIA_CHOICES = [
+    app_commands.Choice(name="anime", value="anime"),
+    app_commands.Choice(name="manga", value="manga"),
+    app_commands.Choice(name="manhwa", value="manhwa"),
+    app_commands.Choice(name="manhua", value="manhua"),
+]
+
+_MEDIA_ALIASES = {
+    "anime": "anime",
+    "manga": "manga",
+    "manhwa": "manhwa",
+    "manwha": "manhwa",  # common typo
+    "manhua": "manhua",
+    "manha": "manhua",
+}
+
+
+def _norm_media_type(s: str | None, default: str = "anime") -> str:
+    """Normalize user media-type input to anime/manga/manhwa/manhua."""
+    t = (s or "").strip().lower().replace(" ", "")
+    return _MEDIA_ALIASES.get(t, default)
+
+
+def _api_kind(user_type: str) -> str:
+    """API query kind: APIs only know anime vs manga (print)."""
+    return "anime" if user_type == "anime" else "manga"
+
+
+def _acceptable_types(user_type: str) -> set[str]:
+    """Exact preferred-type set for scoring, or empty when no preference."""
+    return {user_type} if user_type in ("anime", "manga", "manhwa", "manhua") else set()
+
+
 # --------------------------------------------------------------- feedback UI — self-learning
 class MatchFeedback(discord.ui.View):
     def __init__(self, query: str, key: str, method: str = "", score: float = 0.0):
@@ -429,10 +463,11 @@ async def cmd_help(inter: discord.Interaction):
     )
     e.add_field(
         name="🔍 Search & discover",
-        value="`/search <name> [type]` — matched lookup (DM + feedback), supports "
-              "`JJK Season 2`, `Solo Leveling ch 150`, `S02E05`\n"
+        value="`/search <name> [type] [season] [movie]` — matched lookup (DM + feedback), supports "
+              "`JJK Season 2`, `Solo Leveling ch 150`, `S02E05`, `BTTH` + `season: 3`, `Naruto` + `movie: The Last`; "
+              "type `manhwa`/`manhua` returns that version, not the anime\n"
               "`/news [type]` — latest scraped news (DM)\n"
-              "`/trending [anime|manga]` — what's hot right now\n"
+              "`/trending [anime|manga|manhwa|manhua]` — what's hot right now\n"
               "`/where <name>` — where to watch/read (legal + free hosts)",
         inline=False,
     )
@@ -477,7 +512,8 @@ async def cmd_help(inter: discord.Interaction):
 
 
 @tree.command(name="news", description="Get the latest news — exhaustive web crawl (server-isolated, inbox vs guild)")
-@app_commands.describe(media_type="Filter: anime / manga / manhwa / all")
+@app_commands.describe(media_type="Filter: all / anime / manga / manhwa / manhua")
+@app_commands.choices(media_type=[app_commands.Choice(name="all", value="all")] + _MEDIA_CHOICES)
 async def cmd_news(inter: discord.Interaction, media_type: str = "all"):
     if not await safe_defer(inter, ephemeral=True):
         return
@@ -572,30 +608,51 @@ async def cmd_news(inter: discord.Interaction, media_type: str = "all"):
             await inter.followup.send("❌ Delivery failed.", ephemeral=True)
 
 
-@tree.command(name="search", description="Matched-based title search — exhaustive, finds even unpopular anime")
-@app_commands.describe(name="Title to look up (e.g. 'JJK Season 2', 'Solo Leveling ch 150')", media_type="anime / manga / manhwa")
-async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "anime"):
+@tree.command(name="search", description="Matched title search — exhaustive; season/movie params narrow it down")
+@app_commands.describe(
+    name="Title to look up (e.g. 'JJK', 'Solo Leveling', 'Naruto The Last')",
+    media_type="Which version: anime / manga / manhwa / manhua",
+    season="Season number, e.g. 2 for Season 2 (BTTH Season 3 → season 3)",
+    movie="Movie name, e.g. 'The Last' for Naruto: The Last",
+)
+@app_commands.choices(media_type=_MEDIA_CHOICES)
+async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "anime",
+                     season: int | None = None, movie: str | None = None):
     if not await safe_defer(inter, ephemeral=True):
         return
     gid = _guild_id(inter)
-    mt = media_type.upper()
-    clean, season, unit = parse_query(name)
+    user_type = _norm_media_type(media_type, default="anime")
+    want = _acceptable_types(user_type)
+    kind_a = _api_kind(user_type)
+    kind_b = "manga" if kind_a == "anime" else "anime"
+    clean, parsed_season, unit = parse_query(name)
+    if season is None:
+        season = parsed_season
+    movie = (movie or "").strip() or None
+    # Movie text joins the query so "Naruto"+"The Last" matches "Naruto: The Last".
+    eff = name if not movie else f"{name} {movie}"
 
     # 1) try learned knowledge base first (now strictly thresholded, no false positives).
-    # Async: DB fetch + threaded scoring off the event loop.
-    rec = await amatch_title(name, db, threshold=config.MATCH_THRESHOLD)
+    # Async: DB fetch + threaded scoring off the event loop, biased to the
+    # requested media type so manhwa queries stop returning the anime entry.
+    rec = await amatch_title(eff, db, threshold=config.MATCH_THRESHOLD,
+                             preferred_types=want or None)
     live = None
-    # 2) if no high-confidence local match, exhaustive live search across ALL APIs (AniList, Jikan, Kitsu)
+    # 2) if no high-confidence local match — or the local match is the WRONG
+    # media type (e.g. anime when manhwa was asked) — exhaustive live search
+    # across ALL APIs (AniList, Jikan, Kitsu).
     # This guarantees unpopular titles like Dr. Stone / Spirit Chronicles / Battle Through Heavens are found even when AniList is down.
-    # Parallel: all query variants fan out together, best-scored wins (was 4× serial exhaustive).
-    if not rec:
+    # Parallel: all query variants fan out together with the SAME user-type
+    # preference, best-scored wins (was 4× serial exhaustive with per-variant bias).
+    need_live = not rec
+    if rec and want and (rec.get("media_type") or "").lower() not in want:
+        need_live = True
+    if need_live:
         s = await session()
-        pref = "anime" if mt == "ANIME" else "manga"
-        alt_pref = "manga" if pref == "anime" else "anime"
-        variants = [(name, pref)]
-        if clean != name:
-            variants.append((clean, pref))
-        variants.append((name, alt_pref))
+        variants = [(eff, kind_a)]
+        if clean != eff:
+            variants.append((clean, kind_a))
+        variants.append((eff, kind_b))
         # De-dup variants preserving order
         seen_v = set()
         uniq_v = []
@@ -604,7 +661,8 @@ async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "a
                 seen_v.add((qv, pv))
                 uniq_v.append((qv, pv))
         results = await asyncio.gather(
-            *(fetch_exhaustive_search(s, qv, preferred_type=pv, db=db) for qv, pv in uniq_v),
+            *(fetch_exhaustive_search(s, qv, preferred_type=pv, db=db,
+                                      preferred_types=want or None) for qv, pv in uniq_v),
             return_exceptions=True)
         best_live = None
         best_sc = -1
@@ -618,12 +676,21 @@ async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "a
             if sc > best_sc:
                 best_sc, best_live = sc, r
         live = best_live
-        if live:
+        use_live = False
+        if live and not rec:
+            use_live = True
+        elif live and rec and want and (rec.get("media_type") or "").lower() not in want:
+            # Local hit is the wrong type: adopt live only if it IS the
+            # requested type with a respectable score.
+            if (live.get("media_type") or "").lower() in want and best_sc >= 55:
+                use_live = True
+        if use_live:
             # Learn it with exhaustive variant aliases and image
             aliases = live.get("aliases", []) or []
-            # ensure query itself becomes alias for future instant alias hit
-            if normalize(name) != live["key"]:
-                aliases = list(set(aliases + [name]))
+            # ensure queries become aliases for future instant alias hits
+            for _q in {name, eff}:
+                if normalize(_q) != live["key"]:
+                    aliases = list(set(aliases + [_q]))
             await db_call(db.learn_title, TitleRecord(
                 key=live["key"], canonical=live["canonical"],
                 media_type=live["media_type"], external_id=live.get("anilist_id", "") or live.get("mal_id", ""),
@@ -647,7 +714,7 @@ async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "a
                 titles = [it.get("title", "") for it in recent]
 
                 def _best_sync():
-                    scores = _sm(name, titles)
+                    scores = _sm(eff, titles)
                     bi, bs = -1, 0.0
                     for i, sc in enumerate(scores):
                         if sc > bs:
@@ -665,7 +732,7 @@ async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "a
         await inter.followup.send(f"🤔 No solid match for “{name}”. Tried all live sources (AniList, Jikan, Kitsu). Try a different spelling or check `/trending`.", ephemeral=True)
         return
 
-    rec["season"], rec["unit"] = season, unit
+    rec["season"], rec["unit"], rec["movie"] = season, unit, movie
 
     embed = embeds.search_result_embed(rec, name)
     # Annotate per-context isolation in footer — parallel DB lookups.
@@ -708,7 +775,7 @@ async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "a
                 to_persist.append(it)
         if to_persist:
             await persist_items(to_persist)
-        news = await amatch_news(rec["canonical"], merged_news_pool, threshold=52)
+        news = await amatch_news(rec["canonical"], merged_news_pool, threshold=52, movie=movie)
         # If still none, at least show the raw live items that contain the title
         if not news and live_for_title:
             # Fallback: show live items that mention the title even if scorer is low (for very unpopular)
@@ -721,7 +788,7 @@ async def cmd_search(inter: discord.Interaction, name: str, media_type: str = "a
             fallback_items = await db_call(db.recent_items, 50)
         except Exception:
             fallback_items = []
-        news = await amatch_news(rec["canonical"], fallback_items, threshold=55)
+        news = await amatch_news(rec["canonical"], fallback_items, threshold=55, movie=movie)
     # Per-guild vs inbox delivery: server gets ephemeral in channel, DM gets DM.
     # Parallel DM burst (was 3× serial sends).
     if inter.guild is None:
@@ -1582,28 +1649,40 @@ async def cmd_stats(inter: discord.Interaction):
 
 
 @tree.command(name="where", description="Where can I watch/read <name>? (legal + free, per-server isolated)")
-@app_commands.describe(name="Title to locate", media_type="anime / manga / manhwa")
+@app_commands.describe(name="Title to locate", media_type="Which version: anime / manga / manhwa / manhua")
+@app_commands.choices(media_type=_MEDIA_CHOICES)
 async def cmd_where(inter: discord.Interaction, name: str, media_type: str = "anime"):
     if not await safe_defer(inter, ephemeral=True):
         return
     gid = _guild_id(inter)
-    rec = await amatch_title(name, db, threshold=60)
-    if not rec:
+    user_type = _norm_media_type(media_type, default="anime")
+    want = _acceptable_types(user_type)
+    rec = await amatch_title(name, db, threshold=60, preferred_types=want or None)
+    need_live = not rec
+    if rec and want and (rec.get("media_type") or "").lower() not in want:
+        need_live = True
+    if need_live:
         s = await session()
         clean, _, _ = parse_query(name)
-        pref = "anime" if media_type.lower() == "anime" else "manga"
-        alt = "manga" if pref == "anime" else "anime"
-        # Parallel exhaustive (was 2× serial).
+        kind_a = _api_kind(user_type)
+        kind_b = "manga" if kind_a == "anime" else "anime"
+        # Parallel exhaustive (was 2× serial), scored with the user's type.
         r1, r2 = await asyncio.gather(
-            fetch_exhaustive_search(s, clean, preferred_type=pref, db=db),
-            fetch_exhaustive_search(s, clean, preferred_type=alt, db=db),
+            fetch_exhaustive_search(s, clean, preferred_type=kind_a, db=db, preferred_types=want or None),
+            fetch_exhaustive_search(s, clean, preferred_type=kind_b, db=db, preferred_types=want or None),
             return_exceptions=True)
         live = None
         for r in (r1, r2):
             if isinstance(r, dict) and r.get("canonical"):
                 if live is None or float(r.get("score", 0) or 0) > float(live.get("score", 0) or 0):
                     live = r
-        if live:
+        use_live = False
+        if live and not rec:
+            use_live = True
+        elif live and rec and want and (rec.get("media_type") or "").lower() not in want:
+            if (live.get("media_type") or "").lower() in want and float(live.get("score", 0) or 0) >= 55:
+                use_live = True
+        if use_live:
             await db_call(db.learn_title, TitleRecord(
                 key=live["key"], canonical=live["canonical"],
                 media_type=live["media_type"], anilist_id=live.get("anilist_id", ""), mal_id=live.get("mal_id", ""),
@@ -1645,19 +1724,23 @@ async def cmd_where(inter: discord.Interaction, name: str, media_type: str = "an
 
 
 @tree.command(name="trending", description="What's trending right now (per-server isolated)")
-@app_commands.describe(media_type="anime / manga")
+@app_commands.describe(media_type="Which version: anime / manga / manhwa / manhua")
+@app_commands.choices(media_type=_MEDIA_CHOICES)
 async def cmd_trending(inter: discord.Interaction, media_type: str = "anime"):
     if not await safe_defer(inter, ephemeral=True):
         return
     gid = _guild_id(inter)
     s = await session()
-    mt = "ANIME" if media_type.lower() == "anime" else "MANGA"
+    user_type = _norm_media_type(media_type, default="anime")
+    mt = "ANIME" if user_type == "anime" else "MANGA"
     recs = await fetch_anilist_trending(s, mt, per=10)
     # fallback to Kitsu trending via exhaustive if AniList down/empty.
     # Parallel fallback queries (was 3× serial exhaustive).
     if not recs:
+        kind = _api_kind(user_type)
+        want = _acceptable_types(user_type)
         fallbacks = await asyncio.gather(
-            *(fetch_exhaustive_search(s, q, preferred_type=media_type, db=db)
+            *(fetch_exhaustive_search(s, q, preferred_type=kind, db=db, preferred_types=want or None)
               for q in ["One Piece", "Jujutsu Kaisen", "Demon Slayer"]),
             return_exceptions=True)
         for live in fallbacks:

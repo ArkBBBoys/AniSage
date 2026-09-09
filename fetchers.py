@@ -793,17 +793,29 @@ async def fetch_web_news(session, query: str = "anime news", limit: int = 12) ->
         print(f"[web-news] {query!r} failed: {ex}")
         return items
 
-async def fetch_exhaustive_search(session, query: str, preferred_type: str = "anime", db=None) -> dict | None:
+async def fetch_exhaustive_search(session, query: str, preferred_type: str = "anime", db=None,
+                                  preferred_types: set[str] | None = None) -> dict | None:
     """Truly exhaustive parallel search — self-learning sources.
     Fires ALL available sources in parallel (AniList, Jikan, Kitsu, DDG web, MAL scrape),
     weights candidates by self-learned source reliability (from TitleSearchSource),
     collects every candidate, scores each against the original query via matcher.
+
+    preferred_types (e.g. {"manhwa"}) is the user's requested media type and is
+    applied uniformly to ALL candidates: exact match +15, print-family
+    (manga/manhwa/manhua) +5. This makes variant fan-out comparable, so asking
+    for manhwa actually returns the manhwa entry instead of the anime one.
+    Defaults to {preferred_type} for backward compatibility.
 
     Parallel: source fan-out is semaphore-capped, DB weight fetch + stats writes
     are off the event loop, candidate scoring is threaded.
     """
     # Self-learning: get source weights if db available (off the event loop)
     src_weights = {"anilist": 1.0, "kitsu": 1.0, "jikan": 1.0, "ddg": 1.0, "mal": 1.0}
+    try:
+        from matcher import PRINT_FAMILY as _PRINT_FAMILY
+    except Exception:
+        _PRINT_FAMILY = frozenset({"manga", "manhwa", "manhua"})
+    pref_set = {str(p).lower() for p in (preferred_types if preferred_types else {preferred_type}) if p}
     if db is not None:
         try:
             sdicts = await concurrency.run_db(db.get_title_search_sources)
@@ -917,8 +929,15 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
                 scores_q2 = score_many(q, variants)
                 if scores_q2:
                     best_sc = max(best_sc, max(scores_q2))
-            if r.get("media_type") == preferred_type:
-                best_sc += 1.5
+            mt_low = (r.get("media_type") or "").lower()
+            # Type bonus only flips near-ties (base >= 55): it must never
+            # rescue low-quality web noise over the acceptance floor.
+            if best_sc >= 55:
+                if mt_low and mt_low in pref_set:
+                    best_sc += 15.0
+                elif mt_low in _PRINT_FAMILY and (pref_set & _PRINT_FAMILY):
+                    # Same print family (manga/manhwa/manhua): closer than anime, but not exact.
+                    best_sc += 5.0
             if "score" in r and isinstance(r["score"], (int, float)):
                 best_sc = max(best_sc, float(r["score"]) * 0.95)
             best_sc = best_sc * (0.78 + 0.44 * src_w)
@@ -938,6 +957,8 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
             items = res if isinstance(res, list) else [res]
             for r in items:
                 if r and r.get("canonical"):
+                    # Fallback path has a flat base of 50 (< 55 gate): no type
+                    # bonus here, so web noise can never be rescued by type.
                     candidates.append((50.0 * (0.78 + 0.44 * src_w), r))
 
     # Generic acronym expansion — no hardcoding: for short acronyms like “BTTH”, “JJK”, use DDG to discover the full title
@@ -961,7 +982,7 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
                         break
             if expanded:
                 exp_res, r_anime, r_manga = await asyncio.gather(
-                    fetch_exhaustive_search(session, expanded, preferred_type, db),
+                    fetch_exhaustive_search(session, expanded, preferred_type, db, pref_set),
                     fetch_kitsu_search(session, expanded, "anime"),
                     fetch_kitsu_search(session, expanded, "manga"),
                     return_exceptions=True)
@@ -995,7 +1016,7 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
             alt_q = q[4:].strip()
             if alt_q and len(alt_q) >= 3:
                 try:
-                    alt_res = await fetch_exhaustive_search(session, alt_q, preferred_type, db)
+                    alt_res = await fetch_exhaustive_search(session, alt_q, preferred_type, db, pref_set)
                     if alt_res:
                         sc_alt = score_pair(query, alt_res["canonical"]) * 0.92
                         candidates.append((sc_alt, alt_res))

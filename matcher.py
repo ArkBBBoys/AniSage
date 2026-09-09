@@ -131,6 +131,29 @@ def _jaro_winkler(a: str, b: str) -> float:
 _LEARNED_WEIGHTS = {"set": 0.35, "sort": 0.22, "partial": 0.10, "jaro": 0.18, "ngram": 0.15}
 _WEIGHT_HISTORY: list[dict] = []
 
+# Print media family: manga/manhwa/manhua are the same medium from different
+# regions. Used for "close enough" type preference (smaller bonus than exact).
+PRINT_FAMILY = frozenset({"manga", "manhwa", "manhua"})
+
+
+def _type_bonus(media_type: str | None, preferred: set[str] | frozenset | None,
+                exact: float, family: float) -> float:
+    """Bonus when a candidate's media type matches the user's requested type.
+
+    Exact match gets the full bonus; same-family (manga/manhwa/manhua) gets a
+    smaller one; anything else gets 0. Empty preferred => 0 (no opinion).
+    """
+    if not preferred:
+        return 0.0
+    mt = (media_type or "").lower()
+    if not mt:
+        return 0.0
+    if mt in preferred:
+        return exact
+    if mt in PRINT_FAMILY and any(p in PRINT_FAMILY for p in preferred):
+        return family
+    return 0.0
+
 def get_weights() -> dict:
     return dict(_LEARNED_WEIGHTS)
 
@@ -268,12 +291,12 @@ def score_many(query: str, candidates: list[str],
 def _score_titles_chunk(args) -> list[tuple[float, float, int]]:
     """Worker: score a chunk of (canonical+aliases) title rows.
 
-    Rows are flat (idx, canonical, aliases, confidence) tuples as built by
-    _fuzzy_best_threaded. Returns [(adjusted, raw, index)] per title.
+    Rows are flat (idx, canonical, aliases, confidence, media_type) tuples as
+    built by _fuzzy_best_threaded. Returns [(adjusted, raw, index)] per title.
     """
-    q_clean, rows = args
+    q_clean, rows, pref = args
     res = []
-    for idx, canonical, aliases, confidence in rows:
+    for idx, canonical, aliases, confidence, media_type in rows:
         best = 0.0
         if canonical:
             best = score_pair(q_clean, canonical)
@@ -286,15 +309,25 @@ def _score_titles_chunk(args) -> list[tuple[float, float, int]]:
                 if best >= 99.5:  # early exit on near-perfect
                     break
         adj = best * 0.92 + (confidence or 0.0) * 0.08
+        # Type bonus only flips near-ties (base >= 55): it must never rescue
+        # garbage matches over the acceptance threshold.
+        if adj >= 55:
+            adj += _type_bonus(media_type, pref, exact=12.0, family=4.0)
         res.append((adj, best, idx))
     return res
 
 
 def _fuzzy_best_threaded(q_clean: str, titles: list[dict],
-                         max_workers: int | None = None):
-    """Parallel fuzzy scan over title rows. Returns (best_rec, best_score, best_raw)."""
+                         max_workers: int | None = None,
+                         preferred_types: set[str] | None = None):
+    """Parallel fuzzy scan over title rows. Returns (best_rec, best_score, best_raw).
+
+    preferred_types (e.g. {"manhwa"}) adds a bonus so the user's requested
+    media type wins near-ties instead of always losing to the anime entry.
+    """
     if not titles:
         return None, 0.0, 0.0
+    pref = {str(p).lower() for p in (preferred_types or set()) if p}
     workers = _matcher_workers(max_workers)
     if len(titles) < 40 or workers <= 1:
         best = None
@@ -303,6 +336,8 @@ def _fuzzy_best_threaded(q_clean: str, titles: list[dict],
         for rec in titles:
             raw = _best_score_for_title(q_clean, rec)
             s = raw * 0.92 + (rec.get("confidence") or 0.0) * 0.08
+            if s >= 55:
+                s += _type_bonus(rec.get("media_type"), pref, exact=12.0, family=4.0)
             if s > best_score:
                 best_score, best_raw, best = s, raw, rec
         return best, best_score, best_raw
@@ -311,10 +346,10 @@ def _fuzzy_best_threaded(q_clean: str, titles: list[dict],
     light = []
     for i, rec in enumerate(titles):
         light.append((i, rec.get("canonical", ""), _aliases_for(rec),
-                      rec.get("confidence") or 0.0))
+                      rec.get("confidence") or 0.0, rec.get("media_type") or ""))
     chunk = max(16, -(-len(light) // (workers * 4)))
     chunks = [light[i:i + chunk] for i in range(0, len(light), chunk)]
-    payloads = [(q_clean, ch) for ch in chunks]
+    payloads = [(q_clean, ch, pref) for ch in chunks]
     best_score = 0.0
     best_raw = 0.0
     best_idx = -1
@@ -329,30 +364,61 @@ def _fuzzy_best_threaded(q_clean: str, titles: list[dict],
 
 
 def _match_title_from_rows(q_clean: str, qn: str, titles: list[dict],
-                           db, threshold: float, season, unit) -> dict | None:
+                           db, threshold: float, season, unit,
+                           preferred_types: set[str] | None = None) -> dict | None:
     """Stage 1b + stage 2 over an already-fetched title list (no extra DB I/O)."""
+    pref = {str(p).lower() for p in (preferred_types or set()) if p}
     # Stage 1b: exact token containment over aliases (cheap, serial — early exit).
+    # With a type preference, an exact-type hit anywhere beats everything;
+    # otherwise a print-family hit beats a wrong-type first hit.
+    first_key = None
+    fam_key = None
+    exact_win = False
     try:
         for rec in titles:
+            hit = False
             for al in _aliases_for(rec) + [rec.get("canonical", "")]:
                 an = normalize(al)
                 if not an:
                     continue
                 if qn == an or qn in an.split() or an in qn.split():
-                    rec2 = db.get_title(rec["key"]) if hasattr(db, "get_title") else rec
-                    if rec2:
-                        rec2["score"] = 92.0
-                        rec2["match_method"] = "alias_token"
-                        rec2["season"] = season
-                        rec2["unit"] = unit
-                        return rec2
+                    hit = True
+                    break
+            if not hit:
+                continue
+            if first_key is None:
+                first_key = rec["key"]
+            mt = (rec.get("media_type") or "").lower()
+            if pref and mt in pref:
+                first_key = rec["key"]
+                exact_win = True
+                break
+            if pref and fam_key is None and mt in PRINT_FAMILY and (pref & PRINT_FAMILY):
+                fam_key = rec["key"]
+            if not pref:
+                break
+        chosen = first_key
+        if pref and not exact_win and fam_key is not None:
+            chosen = fam_key
+        if chosen is not None:
+            rec2 = db.get_title(chosen) if hasattr(db, "get_title") else None
+            if rec2 is None:
+                # Light-row fallback: find the row itself.
+                rec2 = next((r for r in titles if r.get("key") == chosen), None)
+            if rec2:
+                rec2["score"] = 92.0
+                rec2["match_method"] = "alias_token"
+                rec2["season"] = season
+                rec2["unit"] = unit
+                return rec2
     except Exception:
         pass
-    best, best_score, best_raw = _fuzzy_best_threaded(q_clean, titles)
+    best, best_score, best_raw = _fuzzy_best_threaded(q_clean, titles,
+                                                      preferred_types=preferred_types)
     if best is not None and best_score >= threshold:
-        # Light rows (all_titles_for_match) lack media_type/image/links — hydrate.
+        # Light rows (all_titles_for_match) lack image/links — hydrate.
         full = None
-        if hasattr(db, "get_title") and best.get("media_type") is None:
+        if hasattr(db, "get_title") and "image" not in best:
             try:
                 full = db.get_title(best["key"])
             except Exception:
@@ -379,7 +445,8 @@ def _fetch_match_rows(db) -> list[dict]:
     return db.all_titles()
 
 
-def match_title(query: str, db, threshold: float = 78.0) -> dict | None:
+def match_title(query: str, db, threshold: float = 78.0,
+                preferred_types: set[str] | None = None) -> dict | None:
     """Return the best matching title record, or None.
 
     Two stage:
@@ -388,25 +455,31 @@ def match_title(query: str, db, threshold: float = 78.0) -> dict | None:
       2. Fuzzy token-set scoring over canonical + aliases, with confidence
           nudge for learned titles.
 
-    Returns None when below threshold — caller must trigger live search rather
-    than presenting a low-confidence mis-match. Season/chapter markers are
-    parsed out first and re-attached to the returned record.
+    preferred_types (e.g. {"manhwa"}) biases stage 2 so the requested media
+    type wins near-ties. Returns None when below threshold — caller must
+    trigger live search rather than presenting a low-confidence mis-match.
+    Season/chapter markers are parsed out first and re-attached to the
+    returned record.
     """
     q_clean, season, unit = parse_query(query)
     qn = normalize(q_clean)
     if not q_clean or not qn:
         return None
+    pref_1a = {str(p).lower() for p in (preferred_types or set()) if p}
     # Stage 1a: exact normalized alias hit (instant)
     if qn:
         row = db.alias_lookup(qn)
         if row:
             rec = db.get_title(row[0])
             if rec:
-                rec["score"] = min(100.0, 90.0 + row[1] * 2)
-                rec["match_method"] = "alias"
-                rec["season"] = season
-                rec["unit"] = unit
-                return rec
+                # With a type preference, a wrong-type alias hit falls through
+                # to containment/fuzzy so the requested type can still win.
+                if not pref_1a or (rec.get("media_type") or "").lower() in pref_1a:
+                    rec["score"] = min(100.0, 90.0 + row[1] * 2)
+                    rec["match_method"] = "alias"
+                    rec["season"] = season
+                    rec["unit"] = unit
+                    return rec
     # Stage 1b + 2 over a single fetched snapshot (one DB round-trip, then
     # threaded scoring -- previously this scanned all_titles() twice).
     # Uses the lightweight projection (key/canonical/aliases/confidence) for
@@ -415,7 +488,8 @@ def match_title(query: str, db, threshold: float = 78.0) -> dict | None:
         titles = _fetch_match_rows(db)
     except Exception:
         return None
-    return _match_title_from_rows(q_clean, qn, titles, db, threshold, season, unit)
+    return _match_title_from_rows(q_clean, qn, titles, db, threshold, season, unit,
+                                  preferred_types=preferred_types)
     # Below threshold => no local match; let caller fall back to live APIs.
     # Do NOT return low-confidence mis-match (was bug causing wrong titles like
     # "Dr. Stone" -> random isekai). Return None so live search is exhaustive.
@@ -424,7 +498,7 @@ def match_title(query: str, db, threshold: float = 78.0) -> dict | None:
 
 def _news_score_one(args) -> tuple[float, int]:
     """Worker for threaded match_news: returns (adjusted_score, index)."""
-    q_clean, season, unit, title = args
+    q_clean, season, unit, title, movie = args
     s = score_pair(q_clean, title or "")
     if season is not None:
         ise = season_in(title or "")
@@ -438,26 +512,38 @@ def _news_score_one(args) -> tuple[float, int]:
             s += 22
         elif iu is not None:
             s -= 25
+    if movie:
+        # Movie boost (no penalty): stories mentioning the movie title or
+        # being movie/film news rank higher for movie searches.
+        mtoks = set(normalize(movie).split())
+        ttoks = set(normalize(title or "").split())
+        if mtoks and mtoks & ttoks:
+            s += 18
+        elif "movie" in (title or "").lower() or "film" in (title or "").lower():
+            s += 10
     return s
 
 
-def match_news(query: str, items: list[dict], threshold: float = 60.0) -> list[dict]:
+def match_news(query: str, items: list[dict], threshold: float = 60.0,
+               movie: str | None = None) -> list[dict]:
     """Rank news items against a query.
 
     Season/chapter markers in the query boost stories that mention the SAME
     season/chapter and sink stories that mention a DIFFERENT one, so
     "Jujutsu Kaisen Season 2" surfaces season-2 news, not season-1 recaps.
+    The optional movie string (e.g. "The Last") boosts movie news (no penalty).
 
     Threaded: titles are scored in a worker pool when the list is large
     (>=30 items), otherwise serial to avoid thread overhead.
     """
     q_clean, season, unit = parse_query(query)
+    movie = (movie or "").strip() or None
     if not items:
         return []
     titles = [(it.get("title", "") if isinstance(it, dict) else "") for it in items]
     if len(items) >= 30:
         workers = _matcher_workers()
-        payloads = [(q_clean, season, unit, ti) for ti in titles]
+        payloads = [(q_clean, season, unit, ti, movie) for ti in titles]
         chunk = max(8, -(-len(payloads) // (workers * 4)))
         chunks = [payloads[i:i + chunk] for i in range(0, len(payloads), chunk)]
 
@@ -471,7 +557,7 @@ def match_news(query: str, items: list[dict], threshold: float = 60.0) -> list[d
                 scores.extend(res)
     else:
         scores = [score_pair(q_clean, ti) for ti in titles]
-        if season is not None or unit is not None:
+        if season is not None or unit is not None or movie:
             adj = []
             for s, it in zip(scores, items):
                 title = it.get("title", "") if isinstance(it, dict) else ""
@@ -487,6 +573,13 @@ def match_news(query: str, items: list[dict], threshold: float = 60.0) -> list[d
                         s += 22
                     elif iu is not None:
                         s -= 25
+                if movie:
+                    mtoks = set(normalize(movie).split())
+                    ttoks = set(normalize(title or "").split())
+                    if mtoks and mtoks & ttoks:
+                        s += 18
+                    elif "movie" in (title or "").lower() or "film" in (title or "").lower():
+                        s += 10
                 adj.append(s)
             scores = adj
     scored = []
@@ -504,7 +597,8 @@ def match_news(query: str, items: list[dict], threshold: float = 60.0) -> list[d
 # and CPU scoring goes to the CPU pool. Sync match_title/match_news above
 # stay for background threads and tests.
 
-async def amatch_title(query: str, db, threshold: float = 78.0) -> dict | None:
+async def amatch_title(query: str, db, threshold: float = 78.0,
+                       preferred_types: set[str] | None = None) -> dict | None:
     """Async match_title: alias lookup + one bulk fetch off-loop, threaded score."""
     import asyncio as _aio
     q_clean, season, unit = parse_query(query)
@@ -512,6 +606,7 @@ async def amatch_title(query: str, db, threshold: float = 78.0) -> dict | None:
     if not q_clean or not qn:
         return None
     loop = _aio.get_running_loop()
+    pref_1a = {str(p).lower() for p in (preferred_types or set()) if p}
     try:
         import concurrency as _conc
         row = await loop.run_in_executor(_conc.DB_EXECUTOR, db.alias_lookup, qn)
@@ -524,11 +619,13 @@ async def amatch_title(query: str, db, threshold: float = 78.0) -> dict | None:
         except Exception:
             rec = None
         if rec:
-            rec["score"] = min(100.0, 90.0 + row[1] * 2)
-            rec["match_method"] = "alias"
-            rec["season"] = season
-            rec["unit"] = unit
-            return rec
+            # Wrong-type alias hit falls through so the requested type can win.
+            if not pref_1a or (rec.get("media_type") or "").lower() in pref_1a:
+                rec["score"] = min(100.0, 90.0 + row[1] * 2)
+                rec["match_method"] = "alias"
+                rec["season"] = season
+                rec["unit"] = unit
+                return rec
 
     def _fetch_rows_sync():
         return _fetch_match_rows(db)
@@ -541,33 +638,58 @@ async def amatch_title(query: str, db, threshold: float = 78.0) -> dict | None:
     if not titles:
         return None
     # Stage 1b containment is cheap; run it inline before threading.
+    # With a type preference, an exact-type hit anywhere beats everything;
+    # otherwise a print-family hit beats a wrong-type first hit.
+    pref_1b = {str(p).lower() for p in (preferred_types or set()) if p}
     try:
+        first_key = None
+        fam_key = None
+        exact_win = False
         for rec in titles:
+            hit = False
             for al in _aliases_for(rec) + [rec.get("canonical", "")]:
                 an = normalize(al)
                 if not an:
                     continue
                 if qn == an or qn in an.split() or an in qn.split():
-                    import concurrency as _conc4
-                    rec2 = await loop.run_in_executor(_conc4.DB_EXECUTOR, db.get_title, rec["key"])
-                    if rec2:
-                        rec2["score"] = 92.0
-                        rec2["match_method"] = "alias_token"
-                        rec2["season"] = season
-                        rec2["unit"] = unit
-                        return rec2
+                    hit = True
                     break
+            if not hit:
+                continue
+            if first_key is None:
+                first_key = rec["key"]
+            mt = (rec.get("media_type") or "").lower()
+            if pref_1b and mt in pref_1b:
+                first_key = rec["key"]
+                exact_win = True
+                break
+            if pref_1b and fam_key is None and mt in PRINT_FAMILY and (pref_1b & PRINT_FAMILY):
+                fam_key = rec["key"]
+            if not pref_1b:
+                break
+        chosen = first_key
+        if pref_1b and not exact_win and fam_key is not None:
+            chosen = fam_key
+        if chosen is not None:
+            import concurrency as _conc4
+            rec2 = await loop.run_in_executor(_conc4.DB_EXECUTOR, db.get_title, chosen)
+            if rec2:
+                rec2["score"] = 92.0
+                rec2["match_method"] = "alias_token"
+                rec2["season"] = season
+                rec2["unit"] = unit
+                return rec2
     except Exception:
         pass
     try:
         import concurrency as _conc5
         best, best_score, best_raw = await loop.run_in_executor(
-            _conc5.CPU_EXECUTOR, _fuzzy_best_threaded_sync, q_clean, titles)
+            _conc5.CPU_EXECUTOR, _fuzzy_best_threaded_sync, q_clean, titles, preferred_types)
     except Exception:
         return None
     if best is not None and best_score >= threshold:
-        # Hydrate light rows to full records for embeds/links.
-        if best.get("media_type") is None:
+        # Hydrate light rows (no image/links) to full records for embeds/links.
+        if "image" not in best:
             try:
                 import concurrency as _conc6
                 full = await loop.run_in_executor(_conc6.DB_EXECUTOR, db.get_title, best["key"])
@@ -584,12 +706,13 @@ async def amatch_title(query: str, db, threshold: float = 78.0) -> dict | None:
     return None
 
 
-def _fuzzy_best_threaded_sync(q_clean: str, titles: list[dict]):
+def _fuzzy_best_threaded_sync(q_clean: str, titles: list[dict], preferred_types=None):
     """Picklable sync entry point for CPU pool (calls threaded scorer)."""
-    return _fuzzy_best_threaded(q_clean, titles)
+    return _fuzzy_best_threaded(q_clean, titles, preferred_types=preferred_types)
 
 
-async def amatch_news(query: str, items: list[dict], threshold: float = 60.0) -> list[dict]:
+async def amatch_news(query: str, items: list[dict], threshold: float = 60.0,
+                      movie: str | None = None) -> list[dict]:
     """Async match_news: scoring off the event loop in the CPU pool."""
     if not items:
         return []
@@ -598,9 +721,9 @@ async def amatch_news(query: str, items: list[dict], threshold: float = 60.0) ->
     try:
         import concurrency as _conc6
         return await loop.run_in_executor(
-            _conc6.CPU_EXECUTOR, match_news, query, list(items), threshold)
+            _conc6.CPU_EXECUTOR, match_news, query, list(items), threshold, movie)
     except Exception:
-        return match_news(query, items, threshold)
+        return match_news(query, items, threshold, movie)
 
 
 async def ascore_many(query: str, candidates: list[str]) -> list[float]:

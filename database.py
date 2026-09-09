@@ -1024,20 +1024,20 @@ class KnowledgeDB:
 
     @_locked
     def all_titles_for_match(self) -> list[dict]:
-        """Lightweight rows for the matcher: only key/canonical/aliases/confidence.
+        """Lightweight rows for the matcher: only key/canonical/aliases/confidence/media_type.
 
         all_titles() loads full rows (image, links, ngram sigs) that matching
         never touches — wasted SQLite I/O + JSON on every /search. This selects
-        just the 4 matching columns, ~3-5x less I/O for large libraries.
+        just the 5 matching columns, ~3-5x less I/O for large libraries.
         """
         with self._session() as s:
             rows = s.execute(
-                select(Title.key, Title.canonical, Title.aliases, Title.confidence)
+                select(Title.key, Title.canonical, Title.aliases, Title.confidence, Title.media_type)
                 .order_by(Title.times_seen.desc(), Title.confidence.desc())
             ).all()
             return [
                 {"key": r[0], "canonical": r[1] or "", "aliases": r[2] or "[]",
-                 "confidence": r[3] or 0.0}
+                 "confidence": r[3] or 0.0, "media_type": r[4] or "unknown"}
                 for r in rows
             ]
 

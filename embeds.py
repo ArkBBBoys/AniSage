@@ -144,13 +144,15 @@ def search_result_embed(rec: dict, query: str) -> discord.Embed:
     if img:
         e.set_image(url=img)
     e.add_field(name="Kind", value=mt.title(), inline=True)
-    if rec.get("season") is not None or rec.get("unit"):
+    if rec.get("season") is not None or rec.get("unit") or rec.get("movie"):
         bits = []
         if rec.get("season") is not None:
             bits.append(f"Season {rec['season']}")
         if rec.get("unit"):
             num, label = rec["unit"]
             bits.append(f"{label} {num}")
+        if rec.get("movie"):
+            bits.append(f"Movie {rec['movie']}")
         e.add_field(name="Requested", value=" · ".join(bits), inline=True)
     e.add_field(name="Confidence", value=bar(rec.get("confidence", 0)), inline=True)
     if rec.get("anilist_id"):
