@@ -10,6 +10,9 @@ boost when ranking news items so season/chapter-specific stories win.
 """
 from __future__ import annotations
 
+import concurrent.futures
+import functools
+import os
 import re
 import unicodedata
 from rapidfuzz import fuzz
@@ -71,7 +74,7 @@ def unit_in(text: str) -> tuple[int, str] | None:
     return (int(m.group(2)), _UNIT_LABELS.get(m.group(1).lower(), "Chapter")) if m else None
 
 
-def normalize(text: str) -> str:
+def _normalize_uncached(text: str) -> str:
     if not text:
         return ""
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
@@ -79,6 +82,12 @@ def normalize(text: str) -> str:
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     toks = [t for t in text.split() if t and t not in _STOP]
     return " ".join(toks)
+
+
+@functools.lru_cache(maxsize=16384)
+def normalize(text: str) -> str:
+    """Cached normalize: pure function, called thousands of times per match."""
+    return _normalize_uncached(text if isinstance(text, str) else "")
 
 
 def tokenize(text: str) -> list[str]:
@@ -218,6 +227,158 @@ def _best_score_for_title(query_clean: str, rec: dict) -> float:
             best = s
     return best
 
+def _matcher_workers(n: int | None = None) -> int:
+    """Thread count for parallel scoring (env MATCHER_WORKERS, default 8)."""
+    try:
+        default = int(os.getenv("MATCHER_WORKERS", "8"))
+    except ValueError:
+        default = 8
+    if n is not None:
+        return max(1, min(n, default))
+    return max(1, default)
+
+
+def score_many(query: str, candidates: list[str],
+               max_workers: int | None = None) -> list[float]:
+    """Threaded batch scoring — same results as serial score_pair, ~Nx faster.
+
+    rapidfuzz releases the GIL, so threads give real speedup. Small batches
+    (<16) stay serial to avoid thread overhead.
+    """
+    cands = list(candidates or [])
+    if not cands:
+        return []
+    if len(cands) < 16:
+        return [score_pair(query, c) for c in cands]
+    workers = _matcher_workers(max_workers)
+    # Chunk to keep tasks coarse-grained (fewer futures, less overhead).
+    chunk = max(8, -(-len(cands) // (workers * 4)))
+    chunks = [cands[i:i + chunk] for i in range(0, len(cands), chunk)]
+
+    def _score_chunk(ch):
+        return [score_pair(query, c) for c in ch]
+
+    out: list[float] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for res in pool.map(_score_chunk, chunks):
+            out.extend(res)
+    return out
+
+
+def _score_titles_chunk(args) -> list[tuple[float, float, int]]:
+    """Worker: score a chunk of (canonical+aliases) title rows.
+
+    Rows are flat (idx, canonical, aliases, confidence) tuples as built by
+    _fuzzy_best_threaded. Returns [(adjusted, raw, index)] per title.
+    """
+    q_clean, rows = args
+    res = []
+    for idx, canonical, aliases, confidence in rows:
+        best = 0.0
+        if canonical:
+            best = score_pair(q_clean, canonical)
+        for al in aliases:
+            if not al:
+                continue
+            s = score_pair(q_clean, al)
+            if s > best:
+                best = s
+                if best >= 99.5:  # early exit on near-perfect
+                    break
+        adj = best * 0.92 + (confidence or 0.0) * 0.08
+        res.append((adj, best, idx))
+    return res
+
+
+def _fuzzy_best_threaded(q_clean: str, titles: list[dict],
+                         max_workers: int | None = None):
+    """Parallel fuzzy scan over title rows. Returns (best_rec, best_score, best_raw)."""
+    if not titles:
+        return None, 0.0, 0.0
+    workers = _matcher_workers(max_workers)
+    if len(titles) < 40 or workers <= 1:
+        best = None
+        best_score = 0.0
+        best_raw = 0.0
+        for rec in titles:
+            raw = _best_score_for_title(q_clean, rec)
+            s = raw * 0.92 + (rec.get("confidence") or 0.0) * 0.08
+            if s > best_score:
+                best_score, best_raw, best = s, raw, rec
+        return best, best_score, best_raw
+    # Pre-extract light tuples to keep workers pickling cheap (threads share
+    # memory, but smaller tuples still help cache locality).
+    light = []
+    for i, rec in enumerate(titles):
+        light.append((i, rec.get("canonical", ""), _aliases_for(rec),
+                      rec.get("confidence") or 0.0))
+    chunk = max(16, -(-len(light) // (workers * 4)))
+    chunks = [light[i:i + chunk] for i in range(0, len(light), chunk)]
+    payloads = [(q_clean, ch) for ch in chunks]
+    best_score = 0.0
+    best_raw = 0.0
+    best_idx = -1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for res in pool.map(_score_titles_chunk, payloads):
+            for adj, raw, idx in res:
+                if adj > best_score:
+                    best_score, best_raw, best_idx = adj, raw, idx
+    if best_idx < 0:
+        return None, 0.0, 0.0
+    return titles[best_idx], best_score, best_raw
+
+
+def _match_title_from_rows(q_clean: str, qn: str, titles: list[dict],
+                           db, threshold: float, season, unit) -> dict | None:
+    """Stage 1b + stage 2 over an already-fetched title list (no extra DB I/O)."""
+    # Stage 1b: exact token containment over aliases (cheap, serial — early exit).
+    try:
+        for rec in titles:
+            for al in _aliases_for(rec) + [rec.get("canonical", "")]:
+                an = normalize(al)
+                if not an:
+                    continue
+                if qn == an or qn in an.split() or an in qn.split():
+                    rec2 = db.get_title(rec["key"]) if hasattr(db, "get_title") else rec
+                    if rec2:
+                        rec2["score"] = 92.0
+                        rec2["match_method"] = "alias_token"
+                        rec2["season"] = season
+                        rec2["unit"] = unit
+                        return rec2
+    except Exception:
+        pass
+    best, best_score, best_raw = _fuzzy_best_threaded(q_clean, titles)
+    if best is not None and best_score >= threshold:
+        # Light rows (all_titles_for_match) lack media_type/image/links — hydrate.
+        full = None
+        if hasattr(db, "get_title") and best.get("media_type") is None:
+            try:
+                full = db.get_title(best["key"])
+            except Exception:
+                full = None
+        rec_out = full if full else best
+        rec_out["score"] = round(best_score, 1)
+        rec_out["raw_score"] = round(best_raw, 1)
+        rec_out["match_method"] = "fuzzy"
+        rec_out["season"] = season
+        rec_out["unit"] = unit
+        return rec_out
+    return None
+
+
+def _fetch_match_rows(db) -> list[dict]:
+    """Prefer the lightweight match projection; fallback to full rows."""
+    try:
+        if hasattr(db, "all_titles_for_match"):
+            rows = db.all_titles_for_match()
+            if rows:
+                return rows
+    except Exception:
+        pass
+    return db.all_titles()
+
+
 def match_title(query: str, db, threshold: float = 78.0) -> dict | None:
     """Return the best matching title record, or None.
 
@@ -246,53 +407,38 @@ def match_title(query: str, db, threshold: float = 78.0) -> dict | None:
                 rec["season"] = season
                 rec["unit"] = unit
                 return rec
-        # Stage 1b: alias substring containment (handles "JJK" -> "jujutsu kaisen" alias)
-        # If query is substring of any alias or vice versa with high token overlap,
-        # treat as alias hit before fuzzy scan.
-        # We scan aliases table directly for near-exact containment to catch short acronyms
-        try:
-            # cheap scan over alias table for containment (small table)
-            import json as _json
-            # db doesn't expose alias scan, so do fuzzy containment via all_titles aliases
-            for rec in db.all_titles():
-                for al in _aliases_for(rec) + [rec.get("canonical","")]:
-                    an = normalize(al)
-                    if not an:
-                        continue
-                    if qn == an or qn in an.split() or an in qn.split():
-                        # exact token containment
-                        rec2 = db.get_title(rec["key"])
-                        if rec2:
-                            rec2["score"] = 92.0
-                            rec2["match_method"] = "alias_token"
-                            rec2["season"] = season
-                            rec2["unit"] = unit
-                            return rec2
-        except Exception:
-            pass
-
-    best = None
-    best_score = 0.0
-    best_raw = 0.0
-    for rec in db.all_titles():
-        raw = _best_score_for_title(q_clean, rec)
-        # confidence nudge (0.08 weight) only helps borderline, not strong false positives
-        s = raw * 0.92 + (rec.get("confidence") or 0.0) * 0.08
-        if s > best_score:
-            best_score = s
-            best_raw = raw
-            best = rec
-    if best and best_score >= threshold:
-        best["score"] = round(best_score, 1)
-        best["raw_score"] = round(best_raw, 1)
-        best["match_method"] = "fuzzy"
-        best["season"] = season
-        best["unit"] = unit
-        return best
+    # Stage 1b + 2 over a single fetched snapshot (one DB round-trip, then
+    # threaded scoring -- previously this scanned all_titles() twice).
+    # Uses the lightweight projection (key/canonical/aliases/confidence) for
+    # ~3-5x less SQLite I/O, then hydrates the winner via get_title.
+    try:
+        titles = _fetch_match_rows(db)
+    except Exception:
+        return None
+    return _match_title_from_rows(q_clean, qn, titles, db, threshold, season, unit)
     # Below threshold => no local match; let caller fall back to live APIs.
     # Do NOT return low-confidence mis-match (was bug causing wrong titles like
     # "Dr. Stone" -> random isekai). Return None so live search is exhaustive.
     return None
+
+
+def _news_score_one(args) -> tuple[float, int]:
+    """Worker for threaded match_news: returns (adjusted_score, index)."""
+    q_clean, season, unit, title = args
+    s = score_pair(q_clean, title or "")
+    if season is not None:
+        ise = season_in(title or "")
+        if ise == season:
+            s += 18
+        elif ise is not None:
+            s -= 25
+    if unit is not None:
+        iu = unit_in(title or "")
+        if iu and iu[0] == unit[0]:
+            s += 22
+        elif iu is not None:
+            s -= 25
+    return s
 
 
 def match_news(query: str, items: list[dict], threshold: float = 60.0) -> list[dict]:
@@ -301,26 +447,171 @@ def match_news(query: str, items: list[dict], threshold: float = 60.0) -> list[d
     Season/chapter markers in the query boost stories that mention the SAME
     season/chapter and sink stories that mention a DIFFERENT one, so
     "Jujutsu Kaisen Season 2" surfaces season-2 news, not season-1 recaps.
+
+    Threaded: titles are scored in a worker pool when the list is large
+    (>=30 items), otherwise serial to avoid thread overhead.
     """
     q_clean, season, unit = parse_query(query)
+    if not items:
+        return []
+    titles = [(it.get("title", "") if isinstance(it, dict) else "") for it in items]
+    if len(items) >= 30:
+        workers = _matcher_workers()
+        payloads = [(q_clean, season, unit, ti) for ti in titles]
+        chunk = max(8, -(-len(payloads) // (workers * 4)))
+        chunks = [payloads[i:i + chunk] for i in range(0, len(payloads), chunk)]
+
+        def _chunk_scores(ch):
+            return [_news_score_one(a) for a in ch]
+
+        import concurrent.futures as _cf
+        scores: list[float] = []
+        with _cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            for res in pool.map(_chunk_scores, chunks):
+                scores.extend(res)
+    else:
+        scores = [score_pair(q_clean, ti) for ti in titles]
+        if season is not None or unit is not None:
+            adj = []
+            for s, it in zip(scores, items):
+                title = it.get("title", "") if isinstance(it, dict) else ""
+                if season is not None:
+                    ise = season_in(title or "")
+                    if ise == season:
+                        s += 18
+                    elif ise is not None:
+                        s -= 25
+                if unit is not None:
+                    iu = unit_in(title or "")
+                    if iu and iu[0] == unit[0]:
+                        s += 22
+                    elif iu is not None:
+                        s -= 25
+                adj.append(s)
+            scores = adj
     scored = []
-    for it in items:
-        s = score_pair(q_clean, it["title"])
-        if season is not None:
-            ise = season_in(it["title"])
-            if ise == season:
-                s += 18
-            elif ise is not None:
-                s -= 25
-        if unit is not None:
-            iu = unit_in(it["title"])
-            if iu and iu[0] == unit[0]:
-                s += 22
-            elif iu is not None:
-                s -= 25
+    for it, s in zip(items, scores):
         if s >= threshold:
             it = dict(it)
             it["score"] = round(s, 1)
             scored.append(it)
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored
+
+
+# ------------------------------------------------- async (non-blocking)
+# These keep the Discord event loop responsive: DB I/O goes to the DB pool
+# and CPU scoring goes to the CPU pool. Sync match_title/match_news above
+# stay for background threads and tests.
+
+async def amatch_title(query: str, db, threshold: float = 78.0) -> dict | None:
+    """Async match_title: alias lookup + one bulk fetch off-loop, threaded score."""
+    import asyncio as _aio
+    q_clean, season, unit = parse_query(query)
+    qn = normalize(q_clean)
+    if not q_clean or not qn:
+        return None
+    loop = _aio.get_running_loop()
+    try:
+        import concurrency as _conc
+        row = await loop.run_in_executor(_conc.DB_EXECUTOR, db.alias_lookup, qn)
+    except Exception:
+        row = None
+    if row:
+        try:
+            import concurrency as _conc2
+            rec = await loop.run_in_executor(_conc2.DB_EXECUTOR, db.get_title, row[0])
+        except Exception:
+            rec = None
+        if rec:
+            rec["score"] = min(100.0, 90.0 + row[1] * 2)
+            rec["match_method"] = "alias"
+            rec["season"] = season
+            rec["unit"] = unit
+            return rec
+
+    def _fetch_rows_sync():
+        return _fetch_match_rows(db)
+
+    try:
+        import concurrency as _conc3
+        titles = await loop.run_in_executor(_conc3.DB_EXECUTOR, _fetch_rows_sync)
+    except Exception:
+        return None
+    if not titles:
+        return None
+    # Stage 1b containment is cheap; run it inline before threading.
+    try:
+        for rec in titles:
+            for al in _aliases_for(rec) + [rec.get("canonical", "")]:
+                an = normalize(al)
+                if not an:
+                    continue
+                if qn == an or qn in an.split() or an in qn.split():
+                    import concurrency as _conc4
+                    rec2 = await loop.run_in_executor(_conc4.DB_EXECUTOR, db.get_title, rec["key"])
+                    if rec2:
+                        rec2["score"] = 92.0
+                        rec2["match_method"] = "alias_token"
+                        rec2["season"] = season
+                        rec2["unit"] = unit
+                        return rec2
+                    break
+    except Exception:
+        pass
+    try:
+        import concurrency as _conc5
+        best, best_score, best_raw = await loop.run_in_executor(
+            _conc5.CPU_EXECUTOR, _fuzzy_best_threaded_sync, q_clean, titles)
+    except Exception:
+        return None
+    if best is not None and best_score >= threshold:
+        # Hydrate light rows to full records for embeds/links.
+        if best.get("media_type") is None:
+            try:
+                import concurrency as _conc6
+                full = await loop.run_in_executor(_conc6.DB_EXECUTOR, db.get_title, best["key"])
+                if full:
+                    best = full
+            except Exception:
+                pass
+        best["score"] = round(best_score, 1)
+        best["raw_score"] = round(best_raw, 1)
+        best["match_method"] = "fuzzy"
+        best["season"] = season
+        best["unit"] = unit
+        return best
+    return None
+
+
+def _fuzzy_best_threaded_sync(q_clean: str, titles: list[dict]):
+    """Picklable sync entry point for CPU pool (calls threaded scorer)."""
+    return _fuzzy_best_threaded(q_clean, titles)
+
+
+async def amatch_news(query: str, items: list[dict], threshold: float = 60.0) -> list[dict]:
+    """Async match_news: scoring off the event loop in the CPU pool."""
+    if not items:
+        return []
+    import asyncio as _aio2
+    loop = _aio2.get_running_loop()
+    try:
+        import concurrency as _conc6
+        return await loop.run_in_executor(
+            _conc6.CPU_EXECUTOR, match_news, query, list(items), threshold)
+    except Exception:
+        return match_news(query, items, threshold)
+
+
+async def ascore_many(query: str, candidates: list[str]) -> list[float]:
+    """Async batch scoring off the event loop."""
+    if not candidates:
+        return []
+    import asyncio as _aio3
+    loop = _aio3.get_running_loop()
+    try:
+        import concurrency as _conc7
+        return await loop.run_in_executor(
+            _conc7.CPU_EXECUTOR, score_many, query, list(candidates))
+    except Exception:
+        return score_many(query, candidates)

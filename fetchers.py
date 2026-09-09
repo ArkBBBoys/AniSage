@@ -6,27 +6,47 @@ Everything is async and shares one aiohttp session. The bot treats these as
 from __future__ import annotations
 
 import asyncio
-import feedparser
+import functools
 import re
+import time as _time
+
+import feedparser
 from bs4 import BeautifulSoup
 
-
-async def _parse_html(text: str):
-    """Parse HTML in a worker thread so the event loop never blocks on BS4."""
-    return await asyncio.get_event_loop().run_in_executor(
-        None, BeautifulSoup, text, "html.parser"
-    )
-
-
-async def _parse_feed(text: str):
-    """Parse an RSS feed in a worker thread (feedparser is CPU-bound)."""
-    return await asyncio.get_event_loop().run_in_executor(None, feedparser.parse, text)
-
+import concurrency
 import config
+from concurrency import DDG_SEM, HOST_SEM, HTTP_SEM, OG_SEM, RSS_SEM
 from database import NewsItem, TitleRecord
 from matcher import normalize, parse_query, score_pair
 
 HEADERS = {"User-Agent": config.USER_AGENT}
+
+
+def _loop_now() -> float:
+    try:
+        return asyncio.get_running_loop().time()
+    except RuntimeError:
+        return _time.monotonic()
+
+
+async def _parse_html(text: str):
+    """Parse HTML in a worker thread so the event loop never blocks on BS4."""
+    return await concurrency.run_blocking(BeautifulSoup, text, "html.parser")
+
+
+async def _parse_feed(text: str):
+    """Parse an RSS feed in a worker thread (feedparser is CPU-bound)."""
+    return await concurrency.run_blocking(feedparser.parse, text)
+
+
+def _summary_text(html: str) -> str:
+    """Blocking summary extraction (runs in worker threads via map)."""
+    if not html:
+        return ""
+    try:
+        return BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    except Exception:
+        return ""
 
 
 def _html_img_url(html: str) -> str:
@@ -49,12 +69,18 @@ def _html_img_url(html: str) -> str:
 
 
 async def _og_image(session, url: str) -> str:
-    """Read the og:image meta tag from an article page (RSS often omits images)."""
+    """Read the og:image meta tag from an article page (RSS often omits images).
+
+    Semaphore-capped: callers fan out with gather_capped instead of serial await.
+    """
+    if not url or not url.startswith("http"):
+        return ""
     try:
-        async with session.get(url, headers=HEADERS, timeout=15) as r:
-            if r.status != 200:
-                return ""
-            text = await r.text()
+        async with OG_SEM:
+            async with session.get(url, headers=HEADERS, timeout=15) as r:
+                if r.status != 200:
+                    return ""
+                text = await r.text()
         soup = await _parse_html(text)
         for prop in ("og:image", "og:image:url", "twitter:image"):
             tag = soup.find("meta", attrs={"property": prop}) or \
@@ -67,110 +93,179 @@ async def _og_image(session, url: str) -> str:
 
 
 # --------------------------------------------------------------------- RSS — now self-learning
+def _parse_rss_entry(e: dict) -> tuple[str, str, str, str, str]:
+    """Blocking RSS entry parse (summary + image). Runs in worker threads."""
+    title = (e.get("title") or "").strip()
+    link = e.get("link") or ""
+    summary = ""
+    for key in ("summary", "description"):
+        if key in e and e[key]:
+            summary = _summary_text(e[key])
+            if summary:
+                break
+    img = ""
+    try:
+        if "media_content" in e and e["media_content"]:
+            img = e["media_content"][0].get("url", "") or ""
+    except Exception:
+        pass
+    if not img:
+        img = _html_img_url(e.get("summary") or "")
+    if not img and e.get("content"):
+        try:
+            img = _html_img_url(e["content"][0].get("value", ""))
+        except Exception:
+            pass
+    pub = e.get("published") or e.get("updated") or ""
+    return title, link, summary[:600], img, pub
+
+
 async def fetch_rss(session, source: dict) -> list[NewsItem]:
     out: list[NewsItem] = []
-    t0 = asyncio.get_event_loop().time()
-    url = source.get("url","")
+    t0 = _loop_now()
+    url = source.get("url", "")
     try:
-        async with session.get(url, headers=HEADERS, timeout=20) as r:
-            text = await r.text()
+        async with RSS_SEM:
+            async with session.get(url, headers=HEADERS, timeout=20) as r:
+                text = await r.text()
         parsed = await _parse_feed(text)
-        for e in parsed.entries[: config.MAX_CACHE]:
-            title = (e.get("title") or "").strip()
-            link = e.get("link") or ""
-            summary = ""
-            for key in ("summary", "description"):
-                if key in e:
-                    summary = BeautifulSoup(e[key], "html.parser").get_text(" ", strip=True)
-                    break
-            img = ""
-            if "media_content" in e and e["media_content"]:
-                img = e["media_content"][0].get("url", "")
-            if not img:
-                img = _html_img_url(e.get("summary") or "")
-            if not img and e.get("content"):
-                img = _html_img_url(e["content"][0].get("value", ""))
-            pub = e.get("published") or e.get("updated") or ""
+        entries = list(parsed.entries[: config.MAX_CACHE])
+        # Threaded entry parsing: BS4 summary/img extraction is CPU-bound and
+        # was serial per entry. Batch it across the blocking pool.
+        if entries and len(entries) > 8:
+            loop = asyncio.get_running_loop()
+
+            def _parse_all(es):
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor(max_workers=8) as pool:
+                    return list(pool.map(_parse_rss_entry, es))
+
+            parsed_rows = await loop.run_in_executor(
+                concurrency.BLOCKING_EXECUTOR, _parse_all, entries)
+        else:
+            parsed_rows = [_parse_rss_entry(e) for e in entries]
+        for title, link, summary, img, pub in parsed_rows:
             out.append(NewsItem(
                 source=source["name"], kind=source["kind"], title=title,
-                url=link, summary=summary[:600], image=img, published=pub,
+                url=link, summary=summary, image=img, published=pub,
             ))
-        for it in [i for i in out if not i.image][: config.OG_IMAGE_LIMIT]:
-            it.image = await _og_image(session, it.url)
+        # Parallel og:image fan-out (was: serial await per item, each up to
+        # 15s). Capped by OG_SEM inside _og_image + gather limit.
+        needy = [it for it in out if not it.image][: config.OG_IMAGE_LIMIT]
+        if needy:
+            imgs = await asyncio.gather(
+                *(_og_image(session, it.url) for it in needy),
+                return_exceptions=True)
+            for it, im in zip(needy, imgs):
+                if isinstance(im, str) and im:
+                    it.image = im
         # Self-learning: update source stats via DB if available (passed via source dict)
         try:
             db = source.get("_db_ref")
             if db and url:
-                latency = (asyncio.get_event_loop().time() - t0)*1000
-                # Run in executor to not block
-                await asyncio.get_event_loop().run_in_executor(None, db.update_news_source_stats, url, True, len(out), latency)
-        except: pass
+                latency = (_loop_now() - t0) * 1000
+                # Run in DB pool to not block
+                await concurrency.run_db(
+                    db.update_news_source_stats, url, True, len(out), latency)
+        except Exception:
+            pass
     except Exception as ex:
         print(f"[rss] {source.get('name', url)} failed: {ex}")
         try:
             db = source.get("_db_ref") if isinstance(source, dict) else None
             if db and url:
-                await asyncio.get_event_loop().run_in_executor(None, db.update_news_source_stats, url, False, 0, 0)
-        except: pass
+                await concurrency.run_db(
+                    db.update_news_source_stats, url, False, 0, 0)
+        except Exception:
+            pass
+    return out
+
+
+async def fetch_many_rss(session, sources: list[dict]) -> list[NewsItem]:
+    """Parallel RSS fan-out across sources (capped by RSS_SEM)."""
+    if not sources:
+        return []
+    results = await asyncio.gather(
+        *(fetch_rss(session, s) for s in sources), return_exceptions=True)
+    out: list[NewsItem] = []
+    for res in results:
+        if isinstance(res, Exception) or not res:
+            continue
+        out.extend(res)
     return out
 
 async def discover_rss_sources_via_web(session, db, limit: int = 6) -> list[dict]:
-    """Self-learning: discover new RSS feeds by crawling the web (DDG)."""
-    candidates = []
+    """Self-learning: discover new RSS feeds by crawling the web (DDG).
+
+    Parallel: DDG queries fan out together, candidate probes fan out together.
+    """
+    candidates: list[dict] = []
     queries = [
         "anime news RSS feed xml",
         "manga news RSS feed",
-        "manhwa news RSS",
-        "anime release RSS feed",
     ]
     try:
-        # Use DDG web search to find RSS URLs
-        from matcher import score_pair  # noqa
-        for q in queries[:2]:
+        # Use DDG web search to find RSS URLs — parallel, semaphore-capped.
+        def _ddg_search(q_):
             try:
-                # Use fetch_ddg_titles as generic web search and also try direct DDG
-                def _ddg_search(q_):
-                    try:
-                        from ddgs import DDGS as _DDGS
-                    except ImportError:
-                        from duckduckgo_search import DDGS as _DDGS
-                    with _DDGS() as ddgs:
-                        return list(ddgs.text(q_, max_results=8))
-                loop = asyncio.get_event_loop()
-                res = await loop.run_in_executor(None, _ddg_search, q)
-                for r in res:
-                    href = r.get("href") or r.get("url") or ""
-                    title = r.get("title") or ""
-                    if not href or len(href) < 10:
-                        continue
-                    low = href.lower()
-                    # Heuristic: RSS-like URL
-                    if any(x in low for x in [".xml", "/rss", "/feed", "rss.xml", "atom.xml", "feed.xml"]):
-                        candidates.append({"url": href, "name": title[:60] or href[:40], "kind": "news", "discovered_via": "web_discovery"})
-                    # Also extract any RSS link from body snippet
-                    body = r.get("body") or ""
-                    # Find URLs in body that look like RSS
-                    for m in re.findall(r"https?://[^\s\"']+\.(?:xml|rss)", body):
-                        candidates.append({"url": m, "name": m[:50], "kind": "news", "discovered_via": "web_discovery"})
+                from ddgs import DDGS as _DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS as _DDGS  # type: ignore
+            with _DDGS() as ddgs:
+                return list(ddgs.text(q_, max_results=8))
+
+        async def _one_query(q):
+            try:
+                async with DDG_SEM:
+                    res = await concurrency.run_blocking(_ddg_search, q)
+                return res or []
             except Exception as ex:
                 print(f"[discover] query {q!r} failed: {ex}")
+                return []
+
+        ddg_results = await asyncio.gather(*(_one_query(q) for q in queries))
+        for res in ddg_results:
+            if isinstance(res, Exception) or not res:
+                continue
+            for r in res:
+                href = r.get("href") or r.get("url") or ""
+                title = r.get("title") or ""
+                if not href or len(href) < 10:
+                    continue
+                low = href.lower()
+                # Heuristic: RSS-like URL
+                if any(x in low for x in [".xml", "/rss", "/feed", "rss.xml", "atom.xml", "feed.xml"]):
+                    candidates.append({"url": href, "name": title[:60] or href[:40], "kind": "news", "discovered_via": "web_discovery"})
+                # Also extract any RSS link from body snippet
+                body = r.get("body") or ""
+                # Find URLs in body that look like RSS
+                for m in re.findall(r"https?://[^\s\"']+\.(?:xml|rss)", body):
+                    candidates.append({"url": m, "name": m[:50], "kind": "news", "discovered_via": "web_discovery"})
         # Also try to scrape known anime news hubs for <link rel=alternate type=application/rss+xml>
         hubs = ["https://www.animenewsnetwork.com", "https://myanimelist.net", "https://anitrendz.net"]
-        for hub in hubs[:1]:
+        async def _hub_links(hub: str):
             try:
-                async with session.get(hub, headers=HEADERS, timeout=12) as r:
-                    if r.status != 200:
-                        continue
-                    html = await r.text()
-                    soup = await _parse_html(html)
-                    for link in soup.find_all("link", attrs={"type": re.compile(r"rss|atom", re.I)}):
-                        href = link.get("href") or ""
-                        if href.startswith("/"):
-                            href = hub.rstrip("/") + href
-                        if href and href.startswith("http"):
-                            candidates.append({"url": href, "name": f"Discovered from {hub}", "kind": "news", "discovered_via": "hub_parse"})
+                async with HTTP_SEM:
+                    async with session.get(hub, headers=HEADERS, timeout=12) as r:
+                        if r.status != 200:
+                            return []
+                        html = await r.text()
+                soup = await _parse_html(html)
+                found = []
+                for link in soup.find_all("link", attrs={"type": re.compile(r"rss|atom", re.I)}):
+                    href = link.get("href") or ""
+                    if href.startswith("/"):
+                        href = hub.rstrip("/") + href
+                    if href and href.startswith("http"):
+                        found.append({"url": href, "name": f"Discovered from {hub}", "kind": "news", "discovered_via": "hub_parse"})
+                return found
             except Exception:
-                pass
+                return []
+
+        hub_results = await asyncio.gather(*(_hub_links(h) for h in hubs[:1]))
+        for found in hub_results:
+            if isinstance(found, list):
+                candidates.extend(found)
         # De-dup
         seen = set()
         uniq = []
@@ -178,27 +273,31 @@ async def discover_rss_sources_via_web(session, db, limit: int = 6) -> list[dict
             if c["url"] not in seen:
                 seen.add(c["url"])
                 uniq.append(c)
-        # Test each candidate with a quick fetch (limit to 4 to avoid overload)
-        tested = []
-        for cand in uniq[:8]:
+        # Test each candidate with a quick fetch — parallel, capped.
+
+        async def _probe(cand: dict):
             try:
-                async with session.get(cand["url"], headers=HEADERS, timeout=10) as r:
-                    txt = await r.text()
-                    # Quick check: contains <rss or <feed or <channel>
-                    low = txt[:2000].lower()
-                    if "<rss" in low or "<feed" in low or "<channel" in low:
-                        # Try full parse to ensure it yields items
-                        parsed = await _parse_feed(txt)
-                        if len(parsed.entries) >= 1:
-                            tested.append(cand)
-                            if len(tested) >= limit:
-                                break
+                async with HTTP_SEM:
+                    async with session.get(cand["url"], headers=HEADERS, timeout=10) as r:
+                        txt = await r.text()
+                # Quick check: contains <rss or <feed or <channel>
+                low = txt[:2000].lower()
+                if "<rss" in low or "<feed" in low or "<channel" in low:
+                    # Try full parse to ensure it yields items
+                    parsed = await _parse_feed(txt)
+                    if len(parsed.entries) >= 1:
+                        return cand
             except Exception:
-                continue
+                pass
+            return None
+
+        probes = await asyncio.gather(*(_probe(c) for c in uniq[:8]))
+        tested = [c for c in probes if isinstance(c, dict)]
+        tested = tested[:limit]
         # Persist to DB via self-learning
         if tested:
             try:
-                added = await asyncio.get_event_loop().run_in_executor(None, db.discover_new_sources_from_web, tested)
+                added = await concurrency.run_db(db.discover_new_sources_from_web, tested)
                 print(f"[discover] added {added} new RSS sources via web")
             except Exception as ex:
                 print(f"[discover] db add failed: {ex}")
@@ -211,11 +310,12 @@ async def discover_rss_sources_via_web(session, db, limit: int = 6) -> list[dict
 # ----------------------------------------------------------------- AniList
 async def _anilist(session, query: str, variables: dict) -> dict:
     try:
-        async with session.post(
-            config.ANILIST_URL, json={"query": query, "variables": variables},
-            headers={**HEADERS, "Content-Type": "application/json"}, timeout=20,
-        ) as r:
-            data = await r.json()
+        async with HTTP_SEM:
+            async with session.post(
+                config.ANILIST_URL, json={"query": query, "variables": variables},
+                headers={**HEADERS, "Content-Type": "application/json"}, timeout=20,
+            ) as r:
+                data = await r.json()
     except Exception as ex:
         print(f"[anilist] request failed: {ex}")
         return {}
@@ -338,30 +438,41 @@ async def fetch_anilist_search(session, query: str, media_type: str = "ANIME") -
 async def fetch_jikan_search(session, query: str, kind: str = "anime") -> dict | None:
     url = f"{config.JIKAN_URL}/{kind}"
     try:
-        async with session.get(url, params={"q": query, "limit": 5},
-                               headers=HEADERS, timeout=20) as r:
-            if r.status != 200:
-                print(f"[jikan] {query!r} {kind} status {r.status}")
-                return None
-            data = await r.json()
+        async with HTTP_SEM:
+            async with session.get(url, params={"q": query, "limit": 5},
+                                   headers=HEADERS, timeout=20) as r:
+                if r.status != 200:
+                    print(f"[jikan] {query!r} {kind} status {r.status}")
+                    return None
+                data = await r.json()
         if not data.get("data"):
             return None
-        # score all 5 and pick best via matcher
-        from matcher import score_pair as _sp
-        best = None
-        best_s = -1
-        for m in data["data"]:
-            cand = m.get("title") or m.get("title_english") or m.get("title_japanese") or ""
-            if not cand:
-                continue
-            s = _sp(query, cand)
-            # also try english title
-            alt = m.get("title_english") or ""
-            if alt and alt != cand:
-                s = max(s, _sp(query, alt))
-            if s > best_s:
-                best_s = s
-                best = m
+        # score all 5 and pick best via matcher — threaded batch.
+        from matcher import score_many as _sm
+        rows = list(data["data"][:5])
+
+        def _best_sync():
+            best = None
+            best_s = -1.0
+            for m in rows:
+                cand = m.get("title") or m.get("title_english") or m.get("title_japanese") or ""
+                if not cand:
+                    continue
+                variants = [cand]
+                alt = m.get("title_english") or ""
+                if alt and alt != cand:
+                    variants.append(alt)
+                scores = _sm(query, variants)
+                s = max(scores) if scores else 0.0
+                if s > best_s:
+                    best_s = s
+                    best = m
+            return best, best_s
+
+        try:
+            best, best_s = await concurrency.run_cpu(_best_sync)
+        except Exception:
+            best, best_s = None, -1
         if not best:
             return None
         m = best
@@ -399,35 +510,46 @@ async def fetch_kitsu_search(session, query: str, kind: str = "anime") -> dict |
     params = {"filter[text]": query, "page[limit]": "5"}
     k_headers = {"User-Agent": config.USER_AGENT, "Accept": "application/vnd.api+json"}
     try:
-        async with session.get(url, params=params, headers=k_headers, timeout=15) as r:
-            if r.status != 200:
-                # Kitsu returns 200 even for no results, so non-200 is real error
-                return None
-            data = await r.json()
+        async with HTTP_SEM:
+            async with session.get(url, params=params, headers=k_headers, timeout=15) as r:
+                if r.status != 200:
+                    # Kitsu returns 200 even for no results, so non-200 is real error
+                    return None
+                data = await r.json()
         items = data.get("data") or []
         if not items:
             return None
-        from matcher import score_pair as _sp
-        best = None
-        best_s = -1
-        for entry in items:
-            attr = entry.get("attributes") or {}
-            cand = attr.get("canonicalTitle") or ""
-            titles = attr.get("titles") or {}
-            # try all title variants
-            variants = [cand] + [v for v in titles.values() if v and v != cand]
-            # also slug
-            slug = attr.get("slug") or ""
-            if slug:
-                variants.append(slug.replace("-", " "))
-            for v in variants:
-                s = _sp(query, v)
+        from matcher import score_many as _sm
+
+        def _best_sync():
+            best = None
+            best_s = -1.0
+            best_cand = ""
+            for entry in items:
+                attr = entry.get("attributes") or {}
+                cand = attr.get("canonicalTitle") or ""
+                titles = attr.get("titles") or {}
+                # try all title variants
+                variants = [cand] + [v for v in titles.values() if v and v != cand]
+                # also slug
+                slug = attr.get("slug") or ""
+                if slug:
+                    variants.append(slug.replace("-", " "))
+                variants = [v for v in variants if v]
+                if not variants:
+                    continue
+                scores = _sm(query, variants)
+                s = max(scores) if scores else 0.0
                 if s > best_s:
                     best_s = s
                     best = entry
                     best_cand = cand
-                    best_titles = titles
-                    best_attr = attr
+            return best, best_s, best_cand
+
+        try:
+            best, best_s, best_cand = await concurrency.run_cpu(_best_sync)
+        except Exception:
+            best, best_s, best_cand = None, -1, ""
         if not best:
             return None
         attr = best.get("attributes") or {}
@@ -469,6 +591,9 @@ async def fetch_kitsu_search(session, query: str, kind: str = "anime") -> dict |
 async def fetch_ddg_titles(session, query: str, kind: str = "anime") -> list[dict]:
     """Generic web search via DuckDuckGo (ddgs library) — finds titles even when APIs are down.
     Uses the open web, not just fixed APIs. Runs DDGS().text() in a worker thread.
+
+    Parallel: all query variants fan out together (capped by DDG_SEM) instead of
+    serially awaiting each variant.
     """
     # Build queries: original + with kind context (anime/manga) — try both
     queries = [query]
@@ -477,52 +602,59 @@ async def fetch_ddg_titles(session, query: str, kind: str = "anime") -> list[dic
     # also try without “the” for better web hit
     if query.lower().startswith("the "):
         queries.append(query[4:])
-    results_all = []
-    for q in queries:
+
+    def _ddg_search(q_):
         try:
-            # Run sync DDGS in thread pool
-            def _ddg_search(q_):
-                try:
-                    from ddgs import DDGS as _DDGS
-                except ImportError:
-                    from duckduckgo_search import DDGS as _DDGS  # type: ignore
-                with _DDGS() as ddgs:
-                    return list(ddgs.text(q_, max_results=5))
-            loop = asyncio.get_event_loop()
-            ddg_results = await loop.run_in_executor(None, _ddg_search, q)
-            for r in ddg_results[:5]:
-                title = (r.get("title") or "").strip()
-                href = (r.get("href") or "").strip()
-                body = (r.get("body") or "").strip()
-                if not title or len(title) < 3:
-                    continue
-                # Two variants: raw title and cleaned
-                variants = [title]
-                clean = re.sub(r"\s*[-–|]\s*(Wikipedia|MyAnimeList|AniList|Kitsu|Crunchyroll|Fandom|IMDb).*$", "", title, flags=re.I).strip()
-                clean = re.sub(r"\s*\(.*(TV|anime|manga).*\)\s*$", "", clean, flags=re.I).strip()
-                if clean and clean != title and 2 <= len(clean) <= 80:
-                    variants.append(clean)
-                # also use body snippet first sentence as potential title?
-                for v in variants:
-                    if len(v) < 2 or len(v) > 90:
-                        continue
-                    # filter obvious non-title results: if title is generic like “Wikipedia”
-                    if v.lower() in ("wikipedia", "fandom", "myanimelist"):
-                        continue
-                    results_all.append({"canonical": v, "key": normalize(v), "media_type": kind, "aliases": [title] if title != v else [], "watch_links": [href] if href else [], "read_links": [], "site_url": href, "image": "", "body": body})
-            if results_all and len(results_all) >= 3:
-                break  # enough
+            from ddgs import DDGS as _DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS as _DDGS  # type: ignore
+        with _DDGS() as ddgs:
+            return list(ddgs.text(q_, max_results=5))
+
+    async def _one(q):
+        try:
+            async with DDG_SEM:
+                return await concurrency.run_blocking(_ddg_search, q)
         except Exception as ex:
             print(f"[ddg-titles] {query!r} {kind} q={q!r} failed: {ex}")
+            return []
+
+    ddg_batches = await asyncio.gather(*(_one(q) for q in queries))
+    results_all = []
+    for ddg_results in ddg_batches:
+        if isinstance(ddg_results, Exception) or not ddg_results:
             continue
-    # Fallback to HTML scrape if ddgs gave nothing (rare)
+        for r in ddg_results[:5]:
+            title = (r.get("title") or "").strip()
+            href = (r.get("href") or "").strip()
+            body = (r.get("body") or "").strip()
+            if not title or len(title) < 3:
+                continue
+            # Two variants: raw title and cleaned
+            variants = [title]
+            clean = re.sub(r"\s*[-–|]\s*(Wikipedia|MyAnimeList|AniList|Kitsu|Crunchyroll|Fandom|IMDb).*$", "", title, flags=re.I).strip()
+            clean = re.sub(r"\s*\(.*(TV|anime|manga).*\)\s*$", "", clean, flags=re.I).strip()
+            if clean and clean != title and 2 <= len(clean) <= 80:
+                variants.append(clean)
+            # also use body snippet first sentence as potential title?
+            for v in variants:
+                if len(v) < 2 or len(v) > 90:
+                    continue
+                # filter obvious non-title results: if title is generic like “Wikipedia”
+                if v.lower() in ("wikipedia", "fandom", "myanimelist"):
+                    continue
+                results_all.append({"canonical": v, "key": normalize(v), "media_type": kind, "aliases": [title] if title != v else [], "watch_links": [href] if href else [], "read_links": [], "site_url": href, "image": "", "body": body})
+        if results_all and len(results_all) >= 3:
+            break  # enough
+    # Fallback to HTML scrape if ddgs gave nothing (rare) — parallel mirrors.
     if not results_all:
-        for base_url in ["https://duckduckgo.com/html/", "https://html.duckduckgo.com/html/"]:
+        async def _html_mirror(base_url: str):
             try:
-                async with session.get(base_url, params={"q": query}, headers=HEADERS, timeout=12) as r:
-                    if r.status != 200:
-                        continue
-                    html = await r.text()
+                async with HTTP_SEM:
+                    async with session.get(base_url, params={"q": query}, headers=HEADERS, timeout=12) as r:
+                        if r.status != 200:
+                            return []
+                        html = await r.text()
                 soup = await _parse_html(html)
                 anchors = soup.select("a.result__a") or soup.find_all("a", href=True)
                 tmp = []
@@ -537,13 +669,18 @@ async def fetch_ddg_titles(session, query: str, kind: str = "anime") -> list[dic
                             qs = up.parse_qs(up.urlparse(href).query)
                             if "uddg" in qs:
                                 href = up.unquote(qs["uddg"][0])
-                        except: pass
+                        except Exception:
+                            pass
                     tmp.append({"canonical": title, "key": normalize(title), "media_type": kind, "aliases": [], "watch_links": [href] if href else [], "read_links": [], "site_url": href, "image": ""})
-                if tmp:
-                    results_all.extend(tmp)
-                    break
+                return tmp
             except Exception:
-                continue
+                return []
+        mirror_results = await asyncio.gather(
+            *(_html_mirror(u) for u in ["https://duckduckgo.com/html/", "https://html.duckduckgo.com/html/"]))
+        for tmp in mirror_results:
+            if tmp:
+                results_all.extend(tmp)
+                break
     return results_all[:8]
 
 async def fetch_mal_scrape(session, query: str, kind: str = "anime") -> list[dict]:
@@ -556,10 +693,11 @@ async def fetch_mal_scrape(session, query: str, kind: str = "anime") -> list[dic
     url = f"{base}/{cat}.php"
     params = {"q": query, "cat": cat}
     try:
-        async with session.get(url, params=params, headers=HEADERS, timeout=15) as r:
-            if r.status != 200:
-                return []
-            html = await r.text()
+        async with HTTP_SEM:
+            async with session.get(url, params=params, headers=HEADERS, timeout=15) as r:
+                if r.status != 200:
+                    return []
+                html = await r.text()
         soup = await _parse_html(html)
         results = []
         # MAL search results are in table with .hoverinfo_trigger or a[href*=/anime/] etc.
@@ -596,6 +734,8 @@ async def fetch_mal_scrape(session, query: str, kind: str = "anime") -> list[dic
 async def fetch_web_news(session, query: str = "anime news", limit: int = 12) -> list[NewsItem]:
     """Generic web news via DuckDuckGo — not limited to RSS.
     Uses ddgs news/text search to crawl the whole web (not just fixed RSS).
+
+    Blocking DDGS call is semaphore-capped and off the event loop.
     """
     items: list[NewsItem] = []
     # Try ddgs news first (most relevant)
@@ -611,9 +751,9 @@ async def fetch_web_news(session, query: str = "anime news", limit: int = 12) ->
                     return list(ddgs.news(q_, max_results=limit))
                 except Exception:
                     return list(ddgs.text(q_ + " news", max_results=limit))
-        loop = asyncio.get_event_loop()
-        ddg_res = await loop.run_in_executor(None, _ddg_news, query)
-        for r in ddg_res[:limit]:
+        async with DDG_SEM:
+            ddg_res = await concurrency.run_blocking(_ddg_news, query)
+        for r in (ddg_res or [])[:limit]:
             title = (r.get("title") or "").strip()
             href = (r.get("url") or r.get("href") or "").strip()
             body = (r.get("body") or "").strip()[:500]
@@ -630,10 +770,11 @@ async def fetch_web_news(session, query: str = "anime news", limit: int = 12) ->
     try:
         url = "https://duckduckgo.com/html/"
         params = {"q": query + " news"}
-        async with session.get(url, params=params, headers=HEADERS, timeout=12) as r:
-            if r.status != 200:
-                return items
-            html = await r.text()
+        async with HTTP_SEM:
+            async with session.get(url, params=params, headers=HEADERS, timeout=12) as r:
+                if r.status != 200:
+                    return items
+                html = await r.text()
         soup = await _parse_html(html)
         for a in soup.select("a.result__a")[:limit]:
             title = a.get_text(strip=True)
@@ -657,19 +798,23 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
     Fires ALL available sources in parallel (AniList, Jikan, Kitsu, DDG web, MAL scrape),
     weights candidates by self-learned source reliability (from TitleSearchSource),
     collects every candidate, scores each against the original query via matcher.
+
+    Parallel: source fan-out is semaphore-capped, DB weight fetch + stats writes
+    are off the event loop, candidate scoring is threaded.
     """
-    import time as _t
-    # Self-learning: get source weights if db available
+    # Self-learning: get source weights if db available (off the event loop)
     src_weights = {"anilist": 1.0, "kitsu": 1.0, "jikan": 1.0, "ddg": 1.0, "mal": 1.0}
     if db is not None:
         try:
-            for sdict in db.get_title_search_sources():
-                name = sdict.get("name","")
+            sdicts = await concurrency.run_db(db.get_title_search_sources)
+            for sdict in sdicts or []:
+                name = sdict.get("name", "")
                 w = float(sdict.get("weight", 1.0))
                 if name in src_weights:
                     src_weights[name] = w
                 # Map anilist -> anilist, etc. DDG weight also applies to ddg titles
-        except: pass
+        except Exception:
+            pass
     try:
         clean, _, _ = parse_query(query)
     except Exception:
@@ -678,12 +823,13 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
     # Fire all sources in parallel — with per-source timing for self-learning
     tasks = []
     task_names = []
+
     def _track(name, coro):
         async def _wrapper():
-            t0 = _t.time()
+            t0 = _time.monotonic()
             try:
                 res = await coro
-                latency = (_t.time() - t0)*1000
+                latency = (_time.monotonic() - t0) * 1000
                 # Success if res has canonical or list non-empty
                 success = False
                 if isinstance(res, dict) and res.get("canonical"):
@@ -697,17 +843,19 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
                     try:
                         # Map task name to source key
                         key = name.split("_")[0]  # anilist_anime -> anilist
-                        if key in ["anilist","kitsu","jikan","ddg","mal"]:
-                            await asyncio.get_event_loop().run_in_executor(None, db.update_title_source_stats, key, success, latency)
-                    except: pass
+                        if key in ["anilist", "kitsu", "jikan", "ddg", "mal"]:
+                            await concurrency.run_db(db.update_title_source_stats, key, success, latency)
+                    except Exception:
+                        pass
                 return res
             except Exception as ex:
                 if db is not None:
                     try:
                         key = name.split("_")[0]
                         if key in src_weights:
-                            await asyncio.get_event_loop().run_in_executor(None, db.update_title_source_stats, key, False, 0)
-                    except: pass
+                            await concurrency.run_db(db.update_title_source_stats, key, False, 0)
+                    except Exception:
+                        pass
                 raise ex
         return _wrapper()
 
@@ -731,77 +879,113 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    candidates: list[tuple[float, dict]] = []
-    for idx, res in enumerate(results):
-        if isinstance(res, Exception) or res is None:
-            continue
-        # Determine source weight for this result
-        src_name = task_names[idx] if idx < len(task_names) else "unknown"
-        # Map task name to source key for weighting
-        src_key = src_name.split("_")[0] if "_" in src_name else src_name
-        src_w = src_weights.get(src_key, 1.0) if src_key in src_weights else 1.0
-        # Also handle ddg_norm, mal_norm etc.
-        if src_key in ["ddg", "mal"] and "norm" in src_name:
-            src_w = src_weights.get(src_key, 1.0) * 0.95
-        items = res if isinstance(res, list) else [res]
-        for r in items:
-            if not r or not r.get("canonical"):
+    # Threaded candidate scoring: score_pair is CPU-bound (5x rapidfuzz per
+    # variant). Score all variants in one worker-pool batch instead of
+    # serially blocking the loop.
+    def _score_candidates_sync():
+        from matcher import score_many
+        scored: list[tuple[float, dict]] = []
+        # Flatten variants first, then batch-score per query string.
+        flat: list[tuple[int, str, str]] = []  # (result_idx, which_query, variant)
+        flat_items: list[dict] = []
+        flat_src_w: list[float] = []
+        for idx, res in enumerate(results):
+            if isinstance(res, Exception) or res is None:
                 continue
-            best_sc = 0.0
-            variants = [r.get("canonical","")] + r.get("aliases",[])
+            src_name = task_names[idx] if idx < len(task_names) else "unknown"
+            src_key = src_name.split("_")[0] if "_" in src_name else src_name
+            src_w = src_weights.get(src_key, 1.0) if src_key in src_weights else 1.0
+            if src_key in ["ddg", "mal"] and "norm" in src_name:
+                src_w = src_weights.get(src_key, 1.0) * 0.95
+            items = res if isinstance(res, list) else [res]
+            for r in items:
+                if not r or not r.get("canonical"):
+                    continue
+                flat_items.append(r)
+                flat_src_w.append(src_w)
+        # Per-item best over variants via threaded score_many
+        for r, src_w in zip(flat_items, flat_src_w):
+            variants = [r.get("canonical", "")] + (r.get("aliases", []) or [])
             if r.get("key"):
                 variants.append(r["key"].replace("-", " "))
-            for v in variants:
-                if not v:
-                    continue
-                sc = score_pair(query, v)
-                if sc > best_sc:
-                    best_sc = sc
-                if q != query:
-                    sc2 = score_pair(q, v)
-                    if sc2 > best_sc:
-                        best_sc = sc2
+            variants = [v for v in variants if v]
+            if not variants:
+                continue
+            scores_q = score_many(query, variants)
+            best_sc = max(scores_q) if scores_q else 0.0
+            if q != query:
+                scores_q2 = score_many(q, variants)
+                if scores_q2:
+                    best_sc = max(best_sc, max(scores_q2))
             if r.get("media_type") == preferred_type:
                 best_sc += 1.5
-            if "score" in r and isinstance(r["score"], (int,float)):
+            if "score" in r and isinstance(r["score"], (int, float)):
                 best_sc = max(best_sc, float(r["score"]) * 0.95)
-            # Self-learning: weight by source reliability (e.g., if Kitsu is more reliable than Jikan currently, boost it)
-            best_sc = best_sc * (0.78 + 0.44 * src_w)  # src_w 0.4-1.8 -> factor 0.95-1.57
-            # Also apply small per-source bias from DB weight
-            candidates.append((best_sc, r))
+            best_sc = best_sc * (0.78 + 0.44 * src_w)
+            scored.append((best_sc, r))
+        return scored
+
+    try:
+        candidates = await concurrency.run_cpu(_score_candidates_sync)
+    except Exception:
+        candidates = []
+        for idx, res in enumerate(results):
+            if isinstance(res, Exception) or res is None:
+                continue
+            src_name = task_names[idx] if idx < len(task_names) else "unknown"
+            src_key = src_name.split("_")[0] if "_" in src_name else src_name
+            src_w = src_weights.get(src_key, 1.0)
+            items = res if isinstance(res, list) else [res]
+            for r in items:
+                if r and r.get("canonical"):
+                    candidates.append((50.0 * (0.78 + 0.44 * src_w), r))
 
     # Generic acronym expansion — no hardcoding: for short acronyms like “BTTH”, “JJK”, use DDG to discover the full title
     q_is_acronym = (len(q.strip()) <= 5 and q.strip().isupper() and q.strip().isalpha()) or (len(q.split()) == 1 and 2 <= len(q.strip()) <= 5 and q.strip().isupper())
     if q_is_acronym:
         # Always try to expand acronyms via web, even if current best looks high (Reddit posts often score 100 for acronyms but are not anime titles)
-        # We will filter Reddit noise later, but first discover the true expansion
+        # We will filter Reddit noise later, but first discover the true expansion.
+        # Parallel: expansion lookups (recursive exhaustive + kitsu anime/manga)
+        # fan out together instead of serial awaits.
         try:
             ddg_acr = await fetch_ddg_titles(session, q, preferred_type)
+            expanded = ""
+            expanded_cand = None
             for cand in ddg_acr:
                 title = cand.get("canonical") or ""
                 if len(title) >= 10 and normalize(title) != normalize(q) and not any(x in title.lower() for x in ["reddit", "quora", "btthj"]):
-                    expanded = re.sub(r"\s*-\s*Wikipedia.*$", "", title, flags=re.I).strip()
-                    expanded = re.sub(r"\s*\|\s*Fandom.*$", "", expanded, flags=re.I).strip()
-                    if len(expanded) >= 8 and expanded.lower() != q.lower():
-                        try:
-                            exp_res = await fetch_exhaustive_search(session, expanded, preferred_type, db)
-                            if exp_res:
-                                sc_exp = score_pair(query, exp_res["canonical"])
-                                bonus = 14 if len(expanded) > 10 else 0
-                                boosted = max(sc_exp, 102 + bonus, score_pair(expanded, exp_res["canonical"]) * 0.97)
-                                candidates.append((boosted, exp_res))
-                                for kind in ("anime","manga"):
-                                    r2 = await fetch_kitsu_search(session, expanded, kind)
-                                    if r2:
-                                        candidates.append((score_pair(query, r2["canonical"]) + 18, r2))
-                                        candidates.append((score_pair(expanded, r2["canonical"]) + 5, r2))
-                        except Exception:
-                            pass
-                        if "wikipedia" in cand.get("site_url","").lower() or "fandom" in cand.get("site_url","").lower() or len(expanded.split()) >= 2:
-                            ddg_sc = 103.0
-                            candidates.append((ddg_sc, {"canonical": expanded, "key": normalize(expanded), "media_type": preferred_type, "aliases": [q, title], "watch_links": [], "read_links": [], "site_url": cand.get("site_url",""), "image": "", "score": ddg_sc}))
-                    if any(len(x) >= 10 for x in [expanded]):
+                    exp = re.sub(r"\s*-\s*Wikipedia.*$", "", title, flags=re.I).strip()
+                    exp = re.sub(r"\s*\|\s*Fandom.*$", "", exp, flags=re.I).strip()
+                    if len(exp) >= 8 and exp.lower() != q.lower():
+                        expanded, expanded_cand = exp, cand
                         break
+            if expanded:
+                exp_res, r_anime, r_manga = await asyncio.gather(
+                    fetch_exhaustive_search(session, expanded, preferred_type, db),
+                    fetch_kitsu_search(session, expanded, "anime"),
+                    fetch_kitsu_search(session, expanded, "manga"),
+                    return_exceptions=True)
+                try:
+                    if isinstance(exp_res, dict) and exp_res.get("canonical"):
+                        sc_exp = score_pair(query, exp_res["canonical"])
+                        bonus = 14 if len(expanded) > 10 else 0
+                        boosted = max(sc_exp, 102 + bonus, score_pair(expanded, exp_res["canonical"]) * 0.97)
+                        candidates.append((boosted, exp_res))
+                except Exception:
+                    pass
+                for r2 in (r_anime, r_manga):
+                    try:
+                        if isinstance(r2, dict) and r2.get("canonical"):
+                            candidates.append((score_pair(query, r2["canonical"]) + 18, r2))
+                            candidates.append((score_pair(expanded, r2["canonical"]) + 5, r2))
+                    except Exception:
+                        pass
+                if expanded_cand is not None and (
+                        "wikipedia" in (expanded_cand.get("site_url", "") or "").lower()
+                        or "fandom" in (expanded_cand.get("site_url", "") or "").lower()
+                        or len(expanded.split()) >= 2):
+                    ddg_sc = 103.0
+                    candidates.append((ddg_sc, {"canonical": expanded, "key": normalize(expanded), "media_type": preferred_type, "aliases": [q, expanded_cand.get("canonical", "")], "watch_links": [], "read_links": [], "site_url": expanded_cand.get("site_url", ""), "image": "", "score": ddg_sc}))
         except Exception as ex:
             print(f"[acronym-expand] {q!r} failed: {ex}")
 
@@ -851,6 +1035,7 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
         return None
     best_r["score"] = round(best_s, 1)
     # ensure aliases include original query for future alias hit
+    best_r.setdefault("aliases", [])
     if normalize(query) != best_r.get("key"):
         try:
             al = best_r.get("aliases",[]) or []
@@ -865,8 +1050,9 @@ async def fetch_exhaustive_search(session, query: str, preferred_type: str = "an
 async def scrape_html(session, target: dict) -> list[NewsItem]:
     out: list[NewsItem] = []
     try:
-        async with session.get(target["url"], headers=HEADERS, timeout=20) as r:
-            html = await r.text()
+        async with HTTP_SEM:
+            async with session.get(target["url"], headers=HEADERS, timeout=20) as r:
+                html = await r.text()
         soup = await _parse_html(html)
         sel = target.get("selector")
         nodes = soup.select(sel) if sel else soup.select("a")
@@ -887,6 +1073,44 @@ async def scrape_html(session, target: dict) -> list[NewsItem]:
 
 
 # ------------------------------------------------------- EverythingMoe index
+async def _fetch_emoe_section(session, section: str, kind: str) -> list[dict]:
+    """One EverythingMoe section page (parallel fan-out helper)."""
+    url = f"{config.EVERYTHINGMOE_BASE}/section/{section}"
+    rows: list[dict] = []
+    try:
+        async with HTTP_SEM:
+            async with session.get(url, headers=HEADERS, timeout=20) as r:
+                if r.status != 200:
+                    return []
+                html = await r.text()
+        soup = await _parse_html(html)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not href.startswith("/s/"):
+                continue
+            slug = href.split("/s/")[-1].strip("/")
+            if not slug:
+                continue
+            name = a.get_text(strip=True) or slug
+            ctx = (a.parent.get_text(" ", strip=True) if a.parent else "")
+            ctx_low = ctx.lower()
+            if "graveyard" in ctx_low or "dead" in ctx_low:
+                status = "graveyard"
+            else:
+                status = "alive"
+            note = ""
+            if "moved to" in ctx_low:
+                note = ctx.split("moved to")[-1].strip(" .")
+            rows.append({
+                "slug": slug, "name": name, "kind": kind,
+                "page_url": config.EVERYTHINGMOE_BASE + href,
+                "status": status, "note": note,
+            })
+    except Exception as ex:
+        print(f"[emoe] section {section} failed: {ex}")
+    return rows
+
+
 async def fetch_everythingmoe_index(session) -> list[dict]:
     """Scrape EverythingMoe's section pages for the currently-live free hosts.
 
@@ -894,40 +1118,18 @@ async def fetch_everythingmoe_index(session) -> list[dict]:
     collect the EverythingMoe *page* for each host (the outbound link is
     JS-gated). EverythingMoe annotates dead hosts ("… is moved to Graveyard"),
     which lets the bot detect URL death and self-heal by rediscovering them.
+
+    Parallel: all sections fetched together instead of serially.
     """
+    section_results = await asyncio.gather(
+        *(_fetch_emoe_section(session, section, kind)
+          for section, kind in config.EMOE_SECTIONS),
+        return_exceptions=True)
     out: list[dict] = []
-    for section, kind in config.EMOE_SECTIONS:
-        url = f"{config.EVERYTHINGMOE_BASE}/section/{section}"
-        try:
-            async with session.get(url, headers=HEADERS, timeout=20) as r:
-                if r.status != 200:
-                    continue
-                html = await r.text()
-            soup = await _parse_html(html)
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if not href.startswith(f"/s/"):
-                    continue
-                slug = href.split("/s/")[-1].strip("/")
-                if not slug:
-                    continue
-                name = a.get_text(strip=True) or slug
-                ctx = (a.parent.get_text(" ", strip=True) if a.parent else "")
-                ctx_low = ctx.lower()
-                if "graveyard" in ctx_low or "dead" in ctx_low:
-                    status = "graveyard"
-                else:
-                    status = "alive"
-                note = ""
-                if "moved to" in ctx_low:
-                    note = ctx.split("moved to")[-1].strip(" .")
-                out.append({
-                    "slug": slug, "name": name, "kind": kind,
-                    "page_url": config.EVERYTHINGMOE_BASE + href,
-                    "status": status, "note": note,
-                })
-        except Exception as ex:
-            print(f"[emoe] section {section} failed: {ex}")
+    for res in section_results:
+        if isinstance(res, Exception) or not res:
+            continue
+        out.extend(res)
     # de-dup by slug+kind (keep graveyard flag if any copy says so)
     seen = {}
     for d in out:
@@ -972,26 +1174,41 @@ async def resolve_host_domain(session, page_url: str) -> str | None:
 
     Free-stream domains move constantly; this picks the first reachable one so
     the bot can link/crawl the actual site directly instead of only via the index.
+
+    Parallel: all candidate domain probes fan out together (capped by HOST_SEM)
+    and the first reachable in page order wins.
     """
     try:
-        async with session.get(page_url, headers=HEADERS, timeout=20) as r:
-            html = await r.text()
+        async with HTTP_SEM:
+            async with session.get(page_url, headers=HEADERS, timeout=20) as r:
+                html = await r.text()
     except Exception:
         return None
-    for dom in extract_domains(html):
-        if dom in _JUNK_DOMAINS or dom.endswith(".everythingmoe.com"):
-            continue
+    domains = [d for d in extract_domains(html)
+               if d not in _JUNK_DOMAINS and not d.endswith(".everythingmoe.com")]
+    if not domains:
+        return None
+
+    async def _probe(dom: str) -> str | None:
         for scheme in ("https", "http"):
             base = f"{scheme}://{dom}"
             try:
                 # Do NOT follow redirects: a 3xx still proves the domain resolves,
                 # and following would land us on an interstitial/bypass page.
-                async with session.get(base, headers=HEADERS, timeout=10,
-                                       allow_redirects=False) as r2:
-                    if r2.status in (200, 301, 302, 307, 308):
-                        return dom
+                async with HOST_SEM:
+                    async with session.get(base, headers=HEADERS, timeout=10,
+                                           allow_redirects=False) as r2:
+                        if r2.status in (200, 301, 302, 307, 308):
+                            return dom
             except Exception:
                 continue
+        return None
+
+    results = await asyncio.gather(*(_probe(d) for d in domains[:12]),
+                                   return_exceptions=True)
+    for dom, res in zip(domains, results):
+        if res == dom:
+            return dom
     return None
 
 
@@ -1041,12 +1258,21 @@ async def learn_host_search(session, host: str) -> tuple[str | None, str | None]
         # keep as best-effort even if JS-rendered (form is authoritative)
         return tmpl, text_input
 
-    # 2) Heuristic fallback: try common paths x common params, verify.
-    for path in ("/search", "/browse", "/find", "/anime", "/manga"):
-        for param in _QUERY_HINTS:
-            tmpl = f"{base}{path}?{param}={{q}}"
-            if await _verify_search(session, tmpl):
+    # 2) Heuristic fallback: try common paths x common params, verify — parallel.
+    probes = [f"{base}{path}?{param}={{q}}"
+              for path in ("/search", "/browse", "/find", "/anime", "/manga")
+              for param in _QUERY_HINTS]
+    try:
+        hits = await asyncio.gather(*(_verify_search(session, t) for t in probes))
+        for tmpl, ok in zip(probes, hits):
+            if ok is True:
+                try:
+                    param = tmpl.split("?")[1].split("=")[0]
+                except Exception:
+                    param = ""
                 return tmpl, param
+    except Exception:
+        pass
     return None, None
 
 
@@ -1055,12 +1281,14 @@ async def _verify_search(session, tmpl: str) -> bool:
 
     JS-rendered result pages won't contain the literal query in raw HTML, so a
     200 is enough proof the endpoint exists (the form is the real authority).
+    Semaphore-capped for parallel fallback probing.
     """
     url = tmpl.format(q="naruto")
     try:
-        async with session.get(url, headers=HEADERS, timeout=12,
-                               allow_redirects=True) as r:
-            return r.status == 200
+        async with HOST_SEM:
+            async with session.get(url, headers=HEADERS, timeout=12,
+                                   allow_redirects=True) as r:
+                return r.status == 200
     except Exception:
         return False
 
@@ -1068,29 +1296,40 @@ async def _verify_search(session, tmpl: str) -> bool:
 async def fetch_news_for_title(session, title: str, limit: int = 8, db=None) -> list[NewsItem]:
     """Exhaustive news search for a specific title — parallel web crawl.
     Self-learning: uses DB-ranked RSS (whole web, not fixed) + DDG + title-aware.
+
+    Parallel: web/DDG queries + per-source RSS fan out together; relevance
+    ranking is threaded.
     """
     queries = [f"{title} anime news", f"{title} manga news", title]
     tasks = []
     for q in queries:
         tasks.append(fetch_web_news(session, q, limit=limit))
         tasks.append(fetch_ddg_titles(session, q, "anime"))
-    async def _rss_filtered():
-        out = []
-        # Use self-learned RSS sources ordered by reliability
-        srcs = _get_active_rss_sources(db, limit=6) if db else config.RSS_SOURCES[:4]
-        for src in srcs[:4]:
-            try:
-                # Attach db for stats
-                if db and isinstance(src, dict):
-                    src = dict(src); src["_db_ref"] = db
-                items = await fetch_rss(session, src)
-                for it in items:
-                    if title.lower() in it.title.lower() or title.lower() in it.summary.lower():
-                        out.append(it)
-            except Exception:
-                pass
-        return out
-    tasks.append(_rss_filtered())
+
+    async def _one_rss(src: dict):
+        try:
+            if db and isinstance(src, dict):
+                src = dict(src)
+                src["_db_ref"] = db
+            items = await fetch_rss(session, src)
+            tl = title.lower()
+            return [it for it in items
+                    if tl in it.title.lower() or tl in (it.summary or "").lower()]
+        except Exception:
+            return []
+
+    # Use self-learned RSS sources ordered by reliability — off the loop.
+    try:
+        if db is not None:
+            srcs = await concurrency.run_db(_get_active_rss_sources_sync, db, "", 6)
+        else:
+            srcs = config.RSS_SOURCES[:4]
+    except Exception:
+        srcs = config.RSS_SOURCES[:4]
+    for src in (srcs or [])[:4]:
+        async def _wrap(s=src):
+            return await _one_rss(s)
+        tasks.append(_wrap())
     results = await asyncio.gather(*tasks, return_exceptions=True)
     items: list[NewsItem] = []
     for res in results:
@@ -1103,23 +1342,46 @@ async def fetch_news_for_title(session, title: str, limit: int = 8, db=None) -> 
             elif isinstance(it, dict) and it.get("canonical"):
                 # DDG title result -> convert to NewsItem
                 items.append(NewsItem(source=f"Web:{title}", kind="news", title=it["canonical"], url=it.get("site_url",""), summary=it.get("body","")[:400], published=""))
-    # De-dup and rank by title relevance to query
+    # De-dup and rank by title relevance to query — threaded scoring.
     seen = set()
     uniq = []
+    pre = []
     for it in items:
         if it.url and it.url in seen:
             continue
         if it.url:
             seen.add(it.url)
-        # Quick relevance filter: title should contain at least one word from query or be high scoring
-        if score_pair(title, it.title) < 35 and title.lower() not in it.title.lower():
-            # Allow if it's from web news for that exact title query (already filtered by DDG)
-            if not it.source.startswith("Web:"):
+        pre.append(it)
+    if pre:
+        try:
+            from matcher import score_many as _score_many
+
+            def _score_all():
+                return _score_many(title, [it.title for it in pre])
+
+            scores = await concurrency.run_cpu(_score_all)
+        except Exception:
+            scores = [score_pair(title, it.title) for it in pre]
+        tl = title.lower()
+        scored_pairs = []
+        for it, sc in zip(pre, scores):
+            if isinstance(sc, Exception):
                 continue
-        uniq.append(it)
-    # Sort by relevance to title
-    uniq.sort(key=lambda x: score_pair(title, x.title), reverse=True)
+            # Quick relevance filter: title should contain at least one word from query or be high scoring
+            if sc < 35 and tl not in it.title.lower():
+                # Allow if it's from web news for that exact title query (already filtered by DDG)
+                if not it.source.startswith("Web:"):
+                    continue
+            scored_pairs.append((sc, it))
+        # Sort by relevance to title
+        scored_pairs.sort(key=lambda x: x[0], reverse=True)
+        uniq = [it for _, it in scored_pairs]
     return uniq[:limit]
+
+
+def _get_active_rss_sources_sync(db, kind: str = "", limit: int = 12) -> list[dict]:
+    """Sync helper so fetch_news_for_title can fetch sources via run_db."""
+    return _get_active_rss_sources(db, kind=kind, limit=limit)
 
 def _get_active_rss_sources(db=None, kind: str = "", limit: int = 12) -> list[dict]:
     """Self-learning: prefer DB-learned RSS sources ordered by score, fallback to config."""
@@ -1144,11 +1406,30 @@ async def fetch_news_exhaustive(session, limit: int = 20, db=None) -> list[NewsI
     """Truly exhaustive news crawl — parallel across all web sources.
     Self-learning: uses DB-ranked RSS sources (by reliability) + whole-web DDG.
     Not limited to 3 fixed web queries; rotates through many and also discovers via DDG.
+
+    Parallel: sources fetched with a concurrency cap (FETCH_CONCURRENCY) so a
+    18-way fan-out goes fast without connection storms.
     """
-    # Base: self-learned RSS (ordered by reliability) + scrape
-    rss_srcs = _get_active_rss_sources(db, limit=10)
-    tasks = [fetch_rss(session, s) for s in rss_srcs]
-    tasks += [scrape_html(session, t) for t in config.SCRAPE_TARGETS]
+    # Base: self-learned RSS (ordered by reliability) + scrape — DB off-loop.
+    try:
+        if db is not None:
+            rss_srcs = await concurrency.run_db(_get_active_rss_sources_sync, db, "", 10)
+        else:
+            rss_srcs = list(config.RSS_SOURCES[:10])
+    except Exception:
+        rss_srcs = list(config.RSS_SOURCES[:10])
+    try:
+        cap = max(4, int(getattr(config, "FETCH_CONCURRENCY", 16)))
+    except Exception:
+        cap = 16
+    sem = asyncio.Semaphore(cap)
+
+    async def _capped(coro):
+        async with sem:
+            return await coro
+
+    tasks = [_capped(fetch_rss(session, s)) for s in (rss_srcs or [])]
+    tasks += [_capped(scrape_html(session, t)) for t in config.SCRAPE_TARGETS]
     # Web: many diverse queries to cover whole anime/manga web, not just “anime news”
     web_queries = [
         "anime news", "manga news", "manhwa news",
@@ -1158,14 +1439,14 @@ async def fetch_news_exhaustive(session, limit: int = 20, db=None) -> list[NewsI
         "anime trending news"
     ]
     # Pick 4 queries per cycle deterministically but rotate
-    import random, time
-    random.seed(int(time.time()) // 900)  # rotate every 15 min
+    import random
+    random.seed(int(_time.monotonic()) // 900)  # rotate every 15 min
     chosen = random.sample(web_queries, k=4)
     for q in chosen:
-        tasks.append(fetch_web_news(session, q, limit=8))
+        tasks.append(_capped(fetch_web_news(session, q, limit=8)))
     # Also do DDG title searches for trending titles (to catch news via web titles)
     for q in ["anime 2026", "manga 2026"]:
-        tasks.append(fetch_ddg_titles(session, q, "anime"))
+        tasks.append(_capped(fetch_ddg_titles(session, q, "anime")))
     results = await asyncio.gather(*tasks, return_exceptions=True)
     items: list[NewsItem] = []
     for res in results:

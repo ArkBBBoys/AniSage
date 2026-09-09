@@ -28,4 +28,5 @@ if __name__ == "__main__":
     if not config.DISCORD_TOKEN:
         raise SystemExit("Set DISCORD_TOKEN in .env (see .env.example).")
     threading.Thread(target=run_bot, daemon=True).start()
-    app.run(host="0.0.0.0", port=8080)
+    # threaded=True: Flask handles concurrent health checks without blocking.
+    app.run(host="0.0.0.0", port=8080, threaded=True)

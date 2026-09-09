@@ -111,3 +111,20 @@ EMOE_REFRESH = _env_int("EMOE_REFRESH", 3600)  # 1h
 
 # Embed theme color (AniList blue)
 THEME_COLOR = 0x02A9FF
+
+# ---------------------------------------------------------------------------
+# Concurrency / parallelism tunables (override via env).
+# These bound fan-out so exhaustive crawls go fast WITHOUT 429s/timeouts.
+# ---------------------------------------------------------------------------
+# Max parallel aiohttp fetches inside one news cycle (RSS + web + scrape).
+FETCH_CONCURRENCY = _env_int("FETCH_CONCURRENCY", 16)
+# Max parallel og:image page fetches per RSS source (was serial).
+OG_IMAGE_CONCURRENCY = _env_int("OG_IMAGE_CONCURRENCY", 8)
+# Max parallel blocking DDG searches (DDGS is sync + rate-limited).
+DDG_CONCURRENCY = _env_int("DDG_CONCURRENCY", 6)
+# Max parallel title-search sources inside fetch_exhaustive_search.
+SEARCH_CONCURRENCY = _env_int("SEARCH_CONCURRENCY", 12)
+# Max parallel Discord DM sends in a burst (Discord rate-limits hard).
+DM_CONCURRENCY = _env_int("DM_CONCURRENCY", 4)
+# Worker threads for CPU-bound fuzzy scoring (rapidfuzz releases the GIL).
+MATCHER_WORKERS = _env_int("MATCHER_WORKERS", 8)

@@ -324,6 +324,26 @@ class KnowledgeDB:
         self._migrate_titles_columns()
         self._migrate_guild_columns()
         self._migrate_learning_columns()
+        self._migrate_perf_indexes()
+        # Cache for adaptive Bayesian prior (avoids a COUNT query per learn).
+        self._prior_cache: tuple[float, float, float] | None = None  # (ts, alpha, beta)
+
+    def _migrate_perf_indexes(self):
+        """Indexes for hot paths: recent_items/news_since order by fetched_at,
+        title scans order by confidence. Single-shot, IF NOT EXISTS."""
+        for stmt in [
+            "CREATE INDEX IF NOT EXISTS ix_items_fetched ON items(fetched_at DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_items_media_fetched ON items(media_type, fetched_at DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_titles_conf_seen ON titles(confidence DESC, times_seen DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_feedback_ts ON feedback(ts DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_alias_used ON aliases(last_used DESC)",
+        ]:
+            try:
+                with self._session() as s:
+                    s.execute(text(stmt))
+                    s.commit()
+            except Exception:
+                pass
 
     def _migrate_titles_columns(self):
         """Best-effort upgrade for pre-existing DBs missing the image column."""
@@ -534,6 +554,9 @@ class KnowledgeDB:
     @_locked
     def bulk_add_items(self, items: list[NewsItem]) -> int:
         """Insert many items in ONE transaction (one commit) — avoids blocking."""
+        items = list(items or [])
+        if not items:
+            return 0
         rows = [
             {
                 "source": it.source, "kind": it.kind, "title": it.title,
@@ -572,6 +595,37 @@ class KnowledgeDB:
             return [_obj_dict(o) for o in rows]
 
     # ----------------------------------------------------------------- titles
+    def _adaptive_prior(self) -> tuple[float, float]:
+        """Cached global-accuracy prior (60s TTL).
+
+        The old code ran two COUNT/SUM queries per learn_title call while
+        holding the DB lock — a major bottleneck during trending ingestion
+        (60 titles × 2 queries). Cache it briefly instead.
+        """
+        now = time.time()
+        cached = getattr(self, "_prior_cache", None)
+        if cached is not None:
+            ts, alpha, beta = cached
+            if now - ts < 60:
+                return alpha, beta
+        try:
+            with self._session() as s:
+                total_fb = s.execute(select(func.count(Feedback.id))).scalar() or 0
+                if total_fb >= 10:
+                    good = s.execute(select(func.coalesce(func.sum(Feedback.correct), 0))).scalar() or 0
+                    global_acc = good / max(1, total_fb)
+                    alpha = 1.8 + global_acc * 1.8  # 1.8-3.6
+                    beta = 1.2 + (1 - global_acc) * 1.4  # 1.2-2.6
+                else:
+                    alpha, beta = 2.0, 1.0
+        except Exception:
+            alpha, beta = 2.0, 1.0
+        try:
+            self._prior_cache = (now, alpha, beta)
+        except Exception:
+            pass
+        return alpha, beta
+
     def _bayesian_confidence(self, correct: int, wrong: int, times_seen: int, base: float = 5.0, last_seen: float = 0, alias_weights: list[float] | None = None, source_quality: float = 0.5) -> float:
         """Upgraded Bayesian confidence — self-learning, recency-aware, alias-aware.
 
@@ -586,20 +640,11 @@ class KnowledgeDB:
         """
         import math
         now = time.time()
-        # Adaptive prior from global feedback (self-learning)
-        # If overall accuracy high, prior is stronger
+        # Adaptive prior from global feedback (self-learning), cached 60s.
+        # If overall accuracy high, prior is stronger.
         try:
-            with self._session() as s:
-                total_fb = s.execute(select(func.count(Feedback.id))).scalar() or 0
-                if total_fb >= 10:
-                    good = s.execute(select(func.coalesce(func.sum(Feedback.correct), 0))).scalar() or 0
-                    global_acc = good / max(1, total_fb)
-                    # Prior adapts: high accuracy → stronger prior (alpha up)
-                    alpha = 1.8 + global_acc * 1.8  # 1.8-3.6
-                    beta = 1.2 + (1 - global_acc) * 1.4  # 1.2-2.6
-                else:
-                    alpha, beta = 2.0, 1.0
-        except:
+            alpha, beta = self._adaptive_prior()
+        except Exception:
             alpha, beta = 2.0, 1.0
         # Posterior mean
         total_fb_title = correct + wrong
@@ -784,6 +829,144 @@ class KnowledgeDB:
             self._set_alias(a, rec.key, weight=1.0)
 
     @_locked
+    def bulk_learn_titles(self, recs: list[TitleRecord]) -> int:
+        """Learn many titles in ONE lock hold + ONE commit per phase.
+
+        learn_title() takes the global lock + commits 1 + N_alias times per
+        title — 60 trending titles meant 60+ lock cycles and 300+ commits.
+        This batches the Title upserts into a single transaction and the alias
+        graph into a second pass, ~10x faster for trending ingestion.
+        """
+        recs = [r for r in (recs or []) if r and r.key]
+        if not recs:
+            return 0
+        now = time.time()
+        # Cache adaptive prior once for the whole batch.
+        try:
+            alpha_beta = self._adaptive_prior()
+        except Exception:
+            alpha_beta = (2.0, 1.0)
+        n = 0
+        with self._session() as s:
+            for rec in recs:
+                try:
+                    sig = self._ngram_sig_for(rec.canonical)
+                    existing = s.get(Title, rec.key)
+                    if existing:
+                        old_conf = float(existing.confidence or 0)
+                        old_last = float(existing.last_seen or now)
+                        days_stale = (now - old_last) / 86400
+                        if days_stale > 30:
+                            decay = min(12.0, (days_stale - 30) * 0.38)
+                            existing.confidence = max(0.0, old_conf - decay)
+                            old_conf = float(existing.confidence)
+                        existing.times_seen = (existing.times_seen or 0) + 1
+                        existing.last_seen = now
+                        try:
+                            alias_list = json.loads(existing.aliases or "[]")
+                            alias_weights = []
+                            for al in alias_list[:6]:
+                                norm = normalize(al)
+                                if not norm:
+                                    continue
+                                arow = s.get(Alias, norm)
+                                if arow and arow.weight:
+                                    alias_weights.append(float(arow.weight))
+                        except Exception:
+                            alias_weights = []
+                        source_q = 0.55
+                        if rec.anilist_id:
+                            source_q = 0.96
+                        elif rec.mal_id:
+                            source_q = 0.88
+                        elif rec.image:
+                            source_q = 0.78
+                        elif rec.watch_links or rec.read_links:
+                            source_q = 0.70
+                        new_conf = self._bayesian_confidence(
+                            existing.feedback_correct or 0,
+                            existing.feedback_wrong or 0,
+                            existing.times_seen,
+                            base=old_conf * 0.15 + 7.8,
+                            last_seen=existing.last_seen,
+                            alias_weights=alias_weights or None,
+                            source_quality=source_q,
+                        )
+                        min_boost = 0.45 + max(0, (68 - old_conf) * 0.018)
+                        existing.confidence = min(100.0, max(new_conf, old_conf + min_boost))
+                        existing.confidence = min(100.0, existing.confidence + 0.35)
+                        if rec.media_type and rec.media_type != "unknown":
+                            existing.media_type = rec.media_type
+                        if rec.anilist_id:
+                            existing.anilist_id = rec.anilist_id
+                        if rec.mal_id:
+                            existing.mal_id = rec.mal_id
+                        if rec.image:
+                            existing.image = rec.image
+                        try:
+                            wl = set(json.loads(existing.watch_links or "[]"))
+                            wl.update(rec.watch_links or [])
+                            existing.watch_links = json.dumps(sorted(wl)[:12])
+                        except Exception:
+                            pass
+                        try:
+                            rl = set(json.loads(existing.read_links or "[]"))
+                            rl.update(rec.read_links or [])
+                            existing.read_links = json.dumps(sorted(rl)[:12])
+                        except Exception:
+                            pass
+                        try:
+                            al = set(json.loads(existing.aliases or "[]"))
+                            al.update(rec.aliases or [])
+                            existing.aliases = json.dumps(sorted(al)[:24])
+                        except Exception:
+                            pass
+                        if sig:
+                            existing.ngram_sig = sig
+                    else:
+                        source_q = 0.55
+                        if rec.anilist_id:
+                            source_q = 0.96
+                        elif rec.mal_id:
+                            source_q = 0.88
+                        elif rec.image:
+                            source_q = 0.78
+                        elif rec.watch_links or rec.read_links:
+                            source_q = 0.70
+                        bonus = 0
+                        if rec.image:
+                            bonus += 2
+                        if rec.watch_links:
+                            bonus += 1.5
+                        if rec.read_links:
+                            bonus += 1.5
+                        init_conf = self._bayesian_confidence(0, 0, 1, base=5.0 + bonus, last_seen=now, alias_weights=None, source_quality=source_q)
+                        s.add(Title(
+                            key=rec.key, canonical=rec.canonical, media_type=rec.media_type,
+                            external_id=rec.external_id, anilist_id=rec.anilist_id,
+                            mal_id=rec.mal_id, image=rec.image,
+                            aliases=json.dumps(rec.aliases or []),
+                            watch_links=json.dumps(rec.watch_links or []),
+                            read_links=json.dumps(rec.read_links or []),
+                            first_seen=now, last_seen=now, times_seen=1, confidence=init_conf,
+                            feedback_correct=0, feedback_wrong=0, last_feedback_ts=0,
+                            ngram_sig=sig,
+                        ))
+                    n += 1
+                except Exception:
+                    continue
+            s.commit()
+        # Alias graph second pass (still under the same outer lock — RLock).
+        for rec in recs:
+            try:
+                self._set_alias(rec.key, rec.key, weight=2.2)
+                for a in (rec.aliases or [])[:12]:
+                    self._set_alias(a, rec.key, weight=1.0)
+            except Exception:
+                continue
+        return n
+
+    @_locked
     def _set_alias(self, alias: str, title_key: str, weight: float = 1.0):
         norm = normalize(alias)
         if not norm:
@@ -840,6 +1023,25 @@ class KnowledgeDB:
             return [_obj_dict(o) for o in rows]
 
     @_locked
+    def all_titles_for_match(self) -> list[dict]:
+        """Lightweight rows for the matcher: only key/canonical/aliases/confidence.
+
+        all_titles() loads full rows (image, links, ngram sigs) that matching
+        never touches — wasted SQLite I/O + JSON on every /search. This selects
+        just the 4 matching columns, ~3-5x less I/O for large libraries.
+        """
+        with self._session() as s:
+            rows = s.execute(
+                select(Title.key, Title.canonical, Title.aliases, Title.confidence)
+                .order_by(Title.times_seen.desc(), Title.confidence.desc())
+            ).all()
+            return [
+                {"key": r[0], "canonical": r[1] or "", "aliases": r[2] or "[]",
+                 "confidence": r[3] or 0.0}
+                for r in rows
+            ]
+
+    @_locked
     def title_count(self) -> int:
         with self._session() as s:
             return s.execute(select(func.count(Title.key))).scalar() or 0
@@ -867,6 +1069,9 @@ class KnowledgeDB:
     @_locked
     def bulk_upsert_resources(self, rows: list[dict]):
         """Insert/update many resources in ONE transaction — avoids blocking."""
+        rows = list(rows or [])
+        if not rows:
+            return
         now = time.time()
         data = [
             {
